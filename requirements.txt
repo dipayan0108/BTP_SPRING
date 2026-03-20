@@ -1,0 +1,32 @@
+# requirements.txt
+# Combined BLIP-FusePPO + SmartDrive
+
+# ── Core ──────────────────────────────────────────────────────────────
+numpy>=1.23
+opencv-python>=4.7
+Pillow>=9.5
+
+# ── Deep learning (PPO) ───────────────────────────────────────────────
+torch>=2.0
+stable-baselines3>=2.0
+gymnasium>=0.29        # SB3 v2 uses gymnasium (not gym)
+
+# ── BLIP / HuggingFace ────────────────────────────────────────────────
+transformers>=4.35
+
+# ── TensorFlow  (environment internal bookkeeping only) ───────────────
+tensorflow>=2.11
+tensorflow-probability>=0.19
+
+# ── CARLA Python API ──────────────────────────────────────────────────
+# Install manually from your CARLA 0.9.13 release folder:
+#   pip install <CARLA_ROOT>/PythonAPI/carla/dist/carla-*.egg
+# or add the .egg to sys.path as done in environment.py
+
+# ── Display / visualisation ───────────────────────────────────────────
+pygame>=2.1
+matplotlib>=3.7
+
+# ── Utilities ─────────────────────────────────────────────────────────
+pandas>=1.5
+tqdm>=4.65
