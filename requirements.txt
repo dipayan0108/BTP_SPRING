@@ -29,11 +29,12 @@ stable-baselines3==1.8.0
 gym==0.21.0                 # version used by SB3 1.8.0 internally
 
 # ── BLIP / HuggingFace ────────────────────────────────────────────────
-# transformers 4.35.2 = last version with py37 support
-# AND has BlipProcessor + BlipForConditionalGeneration
-transformers==4.35.2
-tokenizers==0.14.1          # must match transformers 4.35.x
-huggingface-hub==0.19.4     # py37 compatible
+# transformers 4.30.2 = ACTUAL last version with Python 3.7 support
+# BLIP (BlipProcessor + BlipForConditionalGeneration) available since 4.15.0
+# so 4.30.2 fully supports BLIP-1
+transformers==4.30.2
+tokenizers==0.13.3          # compatible with transformers 4.30.x
+huggingface-hub==0.16.4     # py37 compatible
 
 # ── CARLA Python API ──────────────────────────────────────────────────
 # Do NOT pip install carla — use the .egg file instead.
