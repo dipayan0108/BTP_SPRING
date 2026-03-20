@@ -365,9 +365,11 @@ class TeacherModel:
             f"{collision_banner}"
 
             # ── ROLE + CONTEXT ────────────────────────────────────────────────
-            "You are an expert autonomous driving agent in a CARLA urban simulation.\n"
-            "Your decisions will be used to train a student network via imitation learning.\n"
-            "Every label you produce must be the SAFEST and MOST CORRECT action.\n\n"
+            "You are an expert driving instructor observing a vehicle in a CARLA urban simulation.\n"
+            "The vehicle is driven by an autopilot. Your job is to LABEL each frame — not to drive.\n"
+            "Look at the image and vehicle state, then decide what the CORRECT action should be.\n"
+            "Your labels will be used to train a student network via imitation learning.\n"
+            "Every label must be the SAFEST and MOST CORRECT action for this situation.\n\n"
 
             # ── FIX A: explicit image analysis step ───────────────────────────
             "═══ STEP 1 — ANALYSE THE IMAGE ═══\n"
