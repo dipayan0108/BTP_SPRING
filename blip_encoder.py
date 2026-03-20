@@ -1,7 +1,14 @@
 # blip_encoder.py
-# Extracts 768-dim semantic embeddings from images using BLIP.
-# Uses the BLIP text encoder on the generated caption to produce
-# a fixed-length float32 vector suitable for TF state fusion.
+# BLIP-1 semantic embedding encoder — Python 3.7 compatible.
+#
+# Model:  Salesforce/blip-image-captioning-large
+# Output: 768-dim float32 embedding (L2 normalised)
+# VRAM:   ~400MB fp32  /  ~200MB fp16
+#
+# Compatible with:
+#   Python      3.7.x
+#   torch       1.13.1
+#   transformers 4.35.2
 
 import numpy as np
 import torch
@@ -18,23 +25,22 @@ from parameters import (
 
 class BLIPEncoder:
     """
-    Wraps Salesforce BLIP to produce 768-dim semantic embeddings.
+    Wraps Salesforce BLIP-1 to produce 768-dim semantic embeddings.
+    Same model used for training AND edge inference — no distribution shift.
 
-    Pipeline per image
-    ------------------
-    1.  BLIP vision encoder  →  image features
-    2.  BLIP LLM decoder     →  natural-language caption
-    3.  BLIP text tokenizer  →  token ids
-    4.  BERT-style text encoder (from BLIP processor) → 768-dim float vector
-        (mean-pool over token hidden states)
-
-    The 768-dim vector is returned as a numpy float32 array and cached
-    by image hash to avoid redundant inference every timestep.
+    Pipeline
+    --------
+    1. ViT image encoder      -> image features
+    2. BLIP LLM decoder       -> caption text
+    3. BERT tokenizer         -> token ids
+    4. BLIP text encoder      -> hidden states (seq x 768)
+    5. Mean pool + L2 norm    -> 768-dim float32
     """
 
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[BLIPEncoder] Loading {BLIP_MODEL_NAME} on {self.device} ...")
+        print("[BLIPEncoder] Loading {} on {} ...".format(
+            BLIP_MODEL_NAME, self.device))
 
         self.processor = BlipProcessor.from_pretrained(
             BLIP_MODEL_NAME, use_fast=True
@@ -44,10 +50,8 @@ class BLIPEncoder:
         ).to(self.device)
         self.model.eval()
 
-        # LRU-style cache  {hash → np.ndarray(768,)}
-        self._cache: dict = {}
-
-        # Last valid embedding – returned on error
+        # LRU-style cache {hash: np.ndarray(768,)}
+        self._cache = {}
         self._last_embedding = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
 
         print("[BLIPEncoder] Ready.")
@@ -56,7 +60,8 @@ class BLIPEncoder:
     #  Public API                                                          #
     # ------------------------------------------------------------------ #
 
-    def get_embedding(self, image_rgb: np.ndarray) -> np.ndarray:
+    def get_embedding(self, image_rgb):
+        # type: (np.ndarray) -> np.ndarray
         """
         Parameters
         ----------
@@ -73,27 +78,30 @@ class BLIPEncoder:
         try:
             embedding = self._encode(image_rgb)
         except Exception as exc:
-            print(f"[BLIPEncoder] inference error: {exc}")
+            print("[BLIPEncoder] inference error: {}".format(exc))
             embedding = self._last_embedding.copy()
 
-        # Manage cache size
+        # Evict oldest entry when cache is full
         if len(self._cache) >= BLIP_CACHE_SIZE:
             self._cache.pop(next(iter(self._cache)))
+
         self._cache[cache_key] = embedding
-        self._last_embedding = embedding
+        self._last_embedding   = embedding
         return embedding
 
     def clear_cache(self):
         self._cache.clear()
 
     # ------------------------------------------------------------------ #
-    #  Internal                                                            #
+    #  Internal                                                           #
     # ------------------------------------------------------------------ #
 
-    def _encode(self, image_rgb: np.ndarray) -> np.ndarray:
-        pil_image = Image.fromarray(image_rgb.astype(np.uint8)).convert("RGB")
+    def _encode(self, image_rgb):
+        # type: (np.ndarray) -> np.ndarray
+        pil_image = Image.fromarray(
+            image_rgb.astype(np.uint8)).convert("RGB")
 
-        # ── Step 1 & 2: generate caption ──────────────────────────────
+        # Step 1 & 2: generate caption
         inputs = self.processor(
             images=pil_image,
             text="Describe the road condition and its surroundings:",
@@ -108,9 +116,10 @@ class BLIPEncoder:
                 num_beams=3,
                 no_repeat_ngram_size=2,
             )
-        caption = self.processor.decode(output_ids[0], skip_special_tokens=True)
+        caption = self.processor.decode(
+            output_ids[0], skip_special_tokens=True)
 
-        # ── Step 3 & 4: encode caption → 768-dim vector ───────────────
+        # Step 3 & 4: encode caption -> hidden states
         text_inputs = self.processor.tokenizer(
             caption,
             padding="max_length",
@@ -119,7 +128,6 @@ class BLIPEncoder:
             return_tensors="pt",
         ).to(self.device)
 
-        # Use BLIP's text_encoder (BERT) to get hidden states
         with torch.no_grad():
             text_outputs = self.model.text_encoder(
                 input_ids=text_inputs["input_ids"],
@@ -127,13 +135,13 @@ class BLIPEncoder:
                 return_dict=True,
             )
 
-        # Mean-pool over token dimension → (768,)
-        hidden = text_outputs.last_hidden_state          # (1, seq, 768)
-        mask   = text_inputs["attention_mask"].unsqueeze(-1).float()
-        embedding = (hidden * mask).sum(1) / mask.sum(1) # (1, 768)
+        # Step 5: mean pool over tokens -> (768,)
+        hidden    = text_outputs.last_hidden_state           # (1, seq, 768)
+        mask      = text_inputs["attention_mask"].unsqueeze(-1).float()
+        embedding = (hidden * mask).sum(1) / mask.sum(1)     # (1, 768)
         embedding = embedding.squeeze(0).cpu().numpy().astype(np.float32)
 
-        # L2-normalise for stable downstream fusion
+        # L2 normalise
         norm = np.linalg.norm(embedding)
         if norm > 1e-6:
             embedding = embedding / norm

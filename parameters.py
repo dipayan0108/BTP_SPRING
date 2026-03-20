@@ -13,7 +13,7 @@ IM_HEIGHT = 80
 # BLIP ENCODER
 # ─────────────────────────────────────────────
 BLIP_MODEL_NAME      = "Salesforce/blip-image-captioning-large"
-BLIP_EMBEDDING_DIM   = 768        # full BERT-based text encoder output
+BLIP_EMBEDDING_DIM   = 768        # BERT-based text encoder output
 BLIP_UPDATE_INTERVAL = 10         # regenerate every K steps, cache otherwise
 BLIP_MAX_LENGTH      = 50
 BLIP_CACHE_SIZE      = 100
