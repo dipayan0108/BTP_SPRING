@@ -5,54 +5,57 @@
 #
 #  ROLE IN THE BTP PIPELINE  (PDF Fig 1 — Steps 1, 2, 3):
 #  ─────────────────────────────────────────────────────────────────────────
-#  Step 1  Data Collection   : drive CARLA, capture frames + vehicle state
-#  Step 2  Teacher Inference : Qwen-VL teacher labels every frame
-#  Step 3  Dataset Creation  : save {image, state, action} records to disk
+#  Step 1  Data Collection  : CARLA autopilot drives smoothly
+#  Step 2  Teacher Inference: Qwen-VL labels every frame
+#  Step 3  Dataset Creation : save {image, state, teacher_label} to disk
 #
-#  ARCHITECTURE — Option B (Teacher Drives + Labels):
+#  ARCHITECTURE — Option C (Autopilot Drives, Teacher Labels):
 #  ─────────────────────────────────────────────────────────────────────────
-#  The teacher IS the driver.  There is no old VAE or PPO involved.
-#  CARLA runs in SYNCHRONOUS mode so the simulator freezes between ticks
-#  and the teacher (Qwen-VL, ~1-2 s/frame) has unlimited thinking time.
+#  CARLA's built-in autopilot drives the ego vehicle.
+#  Qwen-VL Teacher observes every frame and outputs what the CORRECT
+#  action should be — this becomes the imitation learning label.
+#  The teacher label is saved to CSV but NOT applied to the vehicle.
+#
+#  WHY THIS IS CORRECT:
+#  ─────────────────────────────────────────────────────────────────────────
+#  The teacher's job is to LABEL, not to drive.
+#  Autopilot generates high-quality smooth trajectories.
+#  Qwen provides semantic scene understanding and expert labels.
+#  This decoupling maximises both trajectory quality and label quality.
 #
 #  WHAT GETS SAVED:
 #  ─────────────────────────────────────────────────────────────────────────
 #  Results_05/distillation_data/
 #  ├── Episode_01/
-#  │   ├── frame_0000.png          ← raw 160×80 semantic-seg image
+#  │   ├── frame_0000.png   ← raw 160×80 semantic-seg image
 #  │   ├── frame_0001.png
 #  │   └── ...
-#  ├── Episode_01_data.csv         ← one row per frame (see CSV_HEADER below)
+#  ├── Episode_01_data.csv  ← one row per frame
 #  ├── Episode_02/
 #  ├── Episode_02_data.csv
-#  └── collection_summary.csv     ← one row per episode
+#  └── collection_summary.csv
 #
-#  CSV COLUMNS — aligned with PDF vehicle state inputs + teacher labels:
+#  CSV COLUMNS:
 #  ─────────────────────────────────────────────────────────────────────────
-#  INPUT COLUMNS  (what the student will receive at inference time):
-#    frame_id           : "frame_0042"
-#    image_path         : absolute path to saved PNG
-#    velocity_kmh       : vehicle speed  (PDF: "vehicle speed")
-#    dist_from_center   : metres from lane centre  (PDF: "distance from lane")
-#    angle_rad          : heading error in radians  (computed by angle_diff)
-#    steering_angle     : current wheel angle [-1, +1]  (PDF: "steering angle")
-#    throttle           : current throttle [0, 1]  (PDF: "throttle value")
-#    nav_command        : 0=straight 1=left 2=right 3=follow (PDF: "nav command")
+#  IDENTIFIERS:
+#    frame_id, image_path
 #
-#  LABEL COLUMNS  (what imitation learning trains the student to output):
-#    teacher_action_label  : discrete action  e.g. "steer_left_slight"
-#    teacher_steer         : continuous steer  ∈ [-1, 1]
-#    teacher_throttle_raw  : continuous throttle_raw  ∈ [-1, 1]
-#    teacher_reason        : LLM natural-language justification
+#  INPUT COLUMNS (student receives these at inference time):
+#    velocity_kmh, dist_from_center, angle_rad,
+#    steering_angle, throttle, nav_command
 #
-#  FEEDBACK COLUMNS  (for analysis, not used in imitation learning):
-#    reward             : CARLA reward this frame  (same formula as main.py)
-#    done               : 1 if episode ended this frame
-#    step_time_s        : wall-clock seconds for this step
+#  LABEL COLUMNS (imitation learning trains student to output these):
+#    teacher_action_label, teacher_steer, teacher_throttle_raw, teacher_reason
+#
+#  AUTOPILOT COLUMNS (what actually happened — for analysis):
+#    autopilot_steer, autopilot_throttle
+#
+#  FEEDBACK COLUMNS (analysis only):
+#    reward, done, step_time_s
 #
 #  HOW TO RUN:
 #  ─────────────────────────────────────────────────────────────────────────
-#  Terminal 1:  ./CarlaUE4.sh
+#  Terminal 1:  CarlaUE4.exe -quality-level=Low -fps=20 -windowed
 #  Terminal 2:  python collect_distillation_data.py
 #
 # =============================================================================
@@ -77,31 +80,32 @@ from parameters import (
 )
 from teacher import TeacherModel, ACTION_TO_CONTINUOUS
 
+# CARLA egg import — works with both pip install and egg file
 try:
     sys.path.append(glob.glob('./carla/carla-*%d.%d-%s.egg' % (
         sys.version_info.major,
         sys.version_info.minor,
         'win-amd64' if os.name == 'nt' else 'linux-x86_64'))[0])
 except IndexError:
-    print("WARNING: CARLA .egg not found — make sure it is in ./carla/")
+    pass  # carla installed via pip — no egg needed
 
 import carla
 import pygame
 
 # =============================================================================
-# COLLECTION PARAMETERS  — edit these to control the run
+# COLLECTION PARAMETERS
 # =============================================================================
 
-COLLECTION_EPISODES  = 20      # number of episodes to collect
+COLLECTION_EPISODES  = 20      # total episodes to collect
 FRAMES_PER_EPISODE   = 500     # max frames per episode
-                               # 500 frames × 20 episodes = 10,000 labelled frames
+                               # 500 × 20 = 10,000 labelled frames total
 
-# Navigation command sent to the teacher every step
+# Navigation command sent to teacher every step
 # 0=straight  1=left  2=right  3=follow lane
 NAV_COMMAND          = 0
 
 # CARLA synchronous fixed timestep
-# 0.05 s = 20 fps physics — teacher gets unlimited time between ticks
+# 0.05s = 20 fps physics — teacher gets unlimited time between ticks
 FIXED_DELTA_SECONDS  = 0.05
 
 # Output paths
@@ -109,11 +113,11 @@ SAVE_DIR         = os.path.join(RESULTS_PATH, 'distillation_data')
 SUMMARY_CSV_PATH = os.path.join(SAVE_DIR,     'collection_summary.csv')
 
 # Spawn points per town — same as main.py
-SPAWN_POINT      = {'Town07': 20, 'Town02': 30}
-SPAWN_POINT_DEFAULT = 12
+SPAWN_POINT          = {'Town07': 20, 'Town02': 30}
+SPAWN_POINT_DEFAULT  = 12
 
 # Route lengths per town — same as main.py
-TOTAL_DISTANCE      = {'Town07': 750, 'Town02': 500}
+TOTAL_DISTANCE       = {'Town07': 750, 'Town02': 500}
 TOTAL_DISTANCE_DEFAULT = 500
 
 # Reward thresholds — must match main.py exactly
@@ -137,18 +141,17 @@ logger = logging.getLogger('DataCollector')
 # CSV SCHEMA
 # =============================================================================
 
-# Per-frame CSV — one row per timestep
 EPISODE_CSV_HEADER = [
     # ── identifiers ───────────────────────────────────────────────────────────
     'frame_id',               # "frame_0042"
-    'image_path',             # absolute path to saved PNG on disk
+    'image_path',             # absolute path to saved PNG
 
-    # ── INPUT columns (student input at inference time) ───────────────────────
+    # ── INPUT columns (student receives at inference time) ────────────────────
     'velocity_kmh',           # speed in km/h
     'dist_from_center',       # metres from lane centre
-    'angle_rad',              # heading error in radians  (from angle_diff)
-    'steering_angle',         # current wheel [-1, +1]    (previous_steer)
-    'throttle',               # current throttle [0, 1]   (self.throttle)
+    'angle_rad',              # heading error in radians
+    'steering_angle',         # autopilot wheel angle [-1, +1]
+    'throttle',               # autopilot throttle [0, 1]
     'nav_command',            # 0=straight 1=left 2=right 3=follow
 
     # ── LABEL columns (imitation learning target) ─────────────────────────────
@@ -157,13 +160,17 @@ EPISODE_CSV_HEADER = [
     'teacher_throttle_raw',   # continuous throttle_raw  ∈ [-1, 1]
     'teacher_reason',         # LLM justification sentence
 
-    # ── FEEDBACK columns (analysis only) ─────────────────────────────────────
-    'reward',                 # CARLA reward  (same formula as main.py)
+    # ── AUTOPILOT columns (what actually drove the car) ───────────────────────
+    'autopilot_steer',        # actual steer applied by autopilot
+    'autopilot_throttle',     # actual throttle applied by autopilot
+
+    # ── FEEDBACK columns (analysis only, not used in training) ────────────────
+    'reward',                 # CARLA reward (same formula as main.py)
     'done',                   # 1 if episode ended this frame
-    'step_time_s',            # wall-clock time for this step (incl. LLM)
+    'teacher_agree',          # 1 if teacher label matches autopilot direction
+    'step_time_s',            # wall-clock time for this step
 ]
 
-# Per-episode summary CSV
 SUMMARY_CSV_HEADER = [
     'episode',
     'total_frames',
@@ -171,6 +178,7 @@ SUMMARY_CSV_HEADER = [
     'avg_reward_per_frame',
     'waypoints_covered',
     'avg_lane_deviation_m',
+    'teacher_agreement_pct',  # % frames where teacher agreed with autopilot
     'wall_time_s',
     'termination_reason',
     'episode_csv_path',
@@ -208,8 +216,8 @@ def append_frame_row(path: str, row: list):
 class SemanticCamera:
     """
     Front-facing semantic-segmentation camera.
-    Spec: 160×80 pixels, FoV 125°, attached at (x=2.4, z=1.5, pitch=-10).
-    Identical to main.py CameraSensor.
+    160×80 pixels, FoV 125°, attached at (x=2.4, z=1.5, pitch=-10).
+    Identical spec to main.py CameraSensor.
     """
 
     def __init__(self, vehicle, world):
@@ -234,13 +242,11 @@ class SemanticCamera:
         if not self:
             return
         image.convert(carla.ColorConverter.CityScapesPalette)
-        raw = np.frombuffer(image.raw_data, dtype=np.uint8)
-        # shape: (width, height, 4) → take first 3 channels → (H, W, 3)
+        raw   = np.frombuffer(image.raw_data, dtype=np.uint8)
         frame = raw.reshape((image.width, image.height, 4))[:, :, :3]
         self.latest_frame.append(frame)
 
     def get_frame(self) -> np.ndarray:
-        """Return latest frame. Guaranteed ready after world.tick() in sync mode."""
         deadline = time.time() + 2.0
         while not self.latest_frame:
             if time.time() > deadline:
@@ -256,10 +262,7 @@ class SemanticCamera:
 
 
 class CollisionSensor:
-    """
-    Collision sensor.
-    Identical spec to main.py CollisionSensor.
-    """
+    """Collision sensor — identical spec to main.py."""
 
     def __init__(self, vehicle, world):
         self.collision_data = []
@@ -350,7 +353,7 @@ def dist_to_line(A, B, p):
     return np.linalg.norm(p - A) if np.isclose(denom, 0) else num / denom
 
 # =============================================================================
-# WAYPOINT ROUTE BUILDER  (mirrors main.py CarlaEnvironment.reset exactly)
+# WAYPOINT ROUTE BUILDER  (mirrors main.py exactly)
 # =============================================================================
 
 def build_route(world_map, start_location, town):
@@ -372,13 +375,12 @@ def build_route(world_map, start_location, town):
     return route
 
 # =============================================================================
-# REWARD FUNCTION  (identical to main.py step() — do NOT modify)
+# REWARD FUNCTION  (identical to main.py — do NOT modify)
 # =============================================================================
 
 def compute_reward(velocity, dist_from_center, angle,
                    collision_history, episode_start_time):
     """Returns (reward, done, reason) — same logic as main.py."""
-
     if len(collision_history) != 0:
         return -10.0, True,  'collision'
     if dist_from_center > MAX_DIST:
@@ -388,8 +390,8 @@ def compute_reward(velocity, dist_from_center, angle,
     if velocity > MAX_SPEED:
         return -10.0, True,  'overspeed'
 
-    centering = max(1.0 - dist_from_center / MAX_DIST,        0.0)
-    ang_fac   = max(1.0 - abs(angle) / np.deg2rad(20),        0.0)
+    centering = max(1.0 - dist_from_center / MAX_DIST,   0.0)
+    ang_fac   = max(1.0 - abs(angle) / np.deg2rad(20),   0.0)
 
     if velocity < MIN_SPEED:
         reward = (velocity / MIN_SPEED) * centering * ang_fac
@@ -400,6 +402,27 @@ def compute_reward(velocity, dist_from_center, angle,
         reward = 1.0 * centering * ang_fac
 
     return reward, False, 'running'
+
+# =============================================================================
+# TEACHER-AUTOPILOT AGREEMENT CHECK
+# =============================================================================
+
+def check_agreement(teacher_label: str, autopilot_steer: float) -> int:
+    """
+    Check if teacher label agrees with autopilot direction.
+    Returns 1 if agreed, 0 if disagreed.
+
+    Used for BTP analysis: how often does Qwen's reasoning
+    match what the optimal autopilot actually does?
+    """
+    if teacher_label in ('go_straight', 'accelerate', 'decelerate', 'brake'):
+        # Non-directional actions — agree if autopilot is also roughly straight
+        return 1 if abs(autopilot_steer) < 0.1 else 0
+    elif 'left' in teacher_label:
+        return 1 if autopilot_steer < -0.05 else 0
+    elif 'right' in teacher_label:
+        return 1 if autopilot_steer >  0.05 else 0
+    return 0
 
 # =============================================================================
 # NPC SPAWNERS
@@ -432,7 +455,8 @@ def spawn_pedestrians(client, world, bp_lib):
         if w_bp.has_attribute('is_invincible'):
             w_bp.set_attribute('is_invincible', 'false')
         if w_bp.has_attribute('speed'):
-            w_bp.set_attribute('speed', w_bp.get_attribute('speed').recommended_values[1])
+            w_bp.set_attribute(
+                'speed', w_bp.get_attribute('speed').recommended_values[1])
         walker = world.try_spawn_actor(w_bp, sp)
         if walker is None:
             continue
@@ -453,13 +477,13 @@ class SynchronousMode:
     """
     Switches CARLA to synchronous fixed-timestep mode.
 
-    In synchronous mode:
-      • Simulator does NOT advance until world.tick() is called.
-      • All sensor callbacks fire immediately after tick().
-      • Teacher can take as long as needed — car waits patiently.
+    In synchronous mode the simulator does NOT advance until
+    world.tick() is called. This gives Qwen-VL unlimited time
+    to label each frame without the car moving during inference.
 
     Restores original settings on exit.
     """
+
     def __init__(self, world, delta=FIXED_DELTA_SECONDS):
         self.world = world
         self.delta = delta
@@ -472,7 +496,9 @@ class SynchronousMode:
             fixed_delta_seconds = self.delta,
             no_rendering_mode   = False,
         ))
-        logger.info(f"CARLA → synchronous mode  (Δt={self.delta}s | {1/self.delta:.0f} fps)")
+        logger.info(
+            f"CARLA → synchronous mode  "
+            f"(Δt={self.delta}s | {1/self.delta:.0f} fps)")
         return self
 
     def __exit__(self, *_):
@@ -486,20 +512,21 @@ class SynchronousMode:
 
 def collect_distillation_data():
     """
-    Full data collection pipeline — Option B (Teacher Drives + Labels).
+    Option C data collection — Autopilot Drives, Teacher Labels.
 
     Per episode:
-      spawn vehicle → reset state → tick loop:
-        world.tick()                 freeze-then-advance
-        get camera frame             semantic-seg 160×80
-        read vehicle state           velocity, location, etc.
-        advance waypoint index       identical to main.py
-        green light override         identical to main.py
-        Qwen-VL teacher inference    IMAGE + STATE → label + continuous action
-        apply teacher action         with exponential smoothing
-        compute reward               identical to main.py
-        save PNG                     raw semantic image for student input
-        write CSV row                state + labels + feedback
+      spawn vehicle
+      enable autopilot          ← CARLA drives smoothly
+      tick loop:
+        world.tick()            ← advance simulator 0.05s
+        get camera frame        ← semantic-seg 160×80
+        read vehicle state      ← velocity, dist, angle, steer, throttle
+        read autopilot control  ← what autopilot actually did
+        advance waypoint index  ← identical to main.py
+        Qwen-VL inference       ← IMAGE + STATE → label (NOT applied to car)
+        compute reward          ← identical to main.py
+        save PNG                ← raw frame for student input
+        write CSV row           ← state + teacher_label + autopilot_action
       destroy vehicle + sensors
       write episode summary
     """
@@ -528,15 +555,15 @@ def collect_distillation_data():
     world_map = world.get_map()
 
     # ── load Qwen-VL teacher ──────────────────────────────────────────────────
-    logger.info("Loading Qwen-VL teacher (first run downloads ~10 GB)…")
+    logger.info("Loading Qwen-VL teacher…")
     teacher = TeacherModel()
     logger.info("Teacher ready ✓")
 
-    # ── spawn persistent NPCs + pedestrians (survive across episodes) ─────────
+    # ── spawn persistent NPCs + pedestrians ───────────────────────────────────
     npc_ids    = spawn_npc_vehicles(client, world, bp_lib)
     walker_ids = spawn_pedestrians(client, world, bp_lib)
 
-    # ── synchronous mode for the entire collection run ────────────────────────
+    # ── synchronous mode ──────────────────────────────────────────────────────
     with SynchronousMode(world):
 
         for episode in range(1, COLLECTION_EPISODES + 1):
@@ -545,7 +572,7 @@ def collect_distillation_data():
             logger.info(f"  EPISODE  {episode:>3} / {COLLECTION_EPISODES}")
             logger.info(f"{'─'*60}")
 
-            # ── episode output paths ──────────────────────────────────────────
+            # ── episode paths ─────────────────────────────────────────────────
             ep_img_dir  = os.path.join(SAVE_DIR, f'Episode_{episode:02d}')
             ep_csv_path = os.path.join(SAVE_DIR, f'Episode_{episode:02d}_data.csv')
             os.makedirs(ep_img_dir, exist_ok=True)
@@ -554,8 +581,10 @@ def collect_distillation_data():
             # ── spawn ego vehicle ─────────────────────────────────────────────
             veh_bp = bp_lib.filter(CAR_NAME)[0]
             if veh_bp.has_attribute('color'):
-                veh_bp.set_attribute('color',
-                    random.choice(veh_bp.get_attribute('color').recommended_values))
+                veh_bp.set_attribute(
+                    'color',
+                    random.choice(
+                        veh_bp.get_attribute('color').recommended_values))
 
             sp_idx    = SPAWN_POINT.get(TOWN, SPAWN_POINT_DEFAULT)
             transform = world_map.get_spawn_points()[sp_idx]
@@ -566,22 +595,26 @@ def collect_distillation_data():
                 continue
 
             # ── attach sensors ────────────────────────────────────────────────
-            front_cam  = SemanticCamera(vehicle, world)
-            col_sens   = CollisionSensor(vehicle, world)
-            disp_cam   = DisplayCamera(vehicle, world) if VISUAL_DISPLAY else None
+            front_cam = SemanticCamera(vehicle, world)
+            col_sens  = CollisionSensor(vehicle, world)
+            disp_cam  = DisplayCamera(vehicle, world) if VISUAL_DISPLAY else None
 
-            # initialisation tick — sensors need one tick to start firing
+            # ── ENABLE AUTOPILOT ──────────────────────────────────────────────
+            # Autopilot drives the vehicle for the entire episode.
+            # Teacher only observes and labels — never controls the car.
+            vehicle.set_autopilot(True)
+
+            # initialisation tick
             world.tick()
 
-            # ── build waypoint route ──────────────────────────────────────────
+            # ── build waypoint route (for reward + waypoint tracking) ─────────
             route = build_route(world_map, vehicle.get_location(), TOWN)
 
-            # ── episode tracking variables ────────────────────────────────────
+            # ── episode state ─────────────────────────────────────────────────
             wp_index           = 0
-            steer_smooth       = 0.0    # smoothed steer applied to vehicle
-            throttle_smooth    = 0.0    # smoothed throttle applied to vehicle
             lane_dev_accum     = 0.0
             total_reward       = 0.0
+            agree_count        = 0
             ep_start_time      = time.time()
             termination_reason = 'max_frames'
 
@@ -594,22 +627,28 @@ def collect_distillation_data():
 
                 # ── STEP 1: TICK ──────────────────────────────────────────────
                 # Advances simulator by FIXED_DELTA_SECONDS.
+                # Autopilot has already submitted its control command.
                 # All sensor callbacks fire here.
                 world.tick()
 
                 # ── STEP 2: GET CAMERA FRAME ──────────────────────────────────
-                # In sync mode this is always ready immediately after tick().
                 # Shape: (80, 160, 3)  dtype: uint8  channels: BGR
                 image_array = front_cam.get_frame()
 
                 # ── STEP 3: READ VEHICLE STATE ────────────────────────────────
                 vel_vec  = vehicle.get_velocity()
                 velocity = np.sqrt(
-                    vel_vec.x**2 + vel_vec.y**2 + vel_vec.z**2) * 3.6  # km/h
+                    vel_vec.x**2 + vel_vec.y**2 + vel_vec.z**2) * 3.6
                 location = vehicle.get_location()
 
-                # ── STEP 4: ADVANCE WAYPOINT INDEX ────────────────────────────
-                # Identical to main.py step() waypoint loop
+                # ── STEP 4: READ AUTOPILOT CONTROL ────────────────────────────
+                # Read what the autopilot actually did this tick.
+                # Saved to CSV for comparison with teacher labels.
+                ctrl              = vehicle.get_control()
+                autopilot_steer   = float(ctrl.steer)
+                autopilot_throttle = float(ctrl.throttle)
+
+                # ── STEP 5: ADVANCE WAYPOINT INDEX ────────────────────────────
                 idx = wp_index
                 for _ in range(len(route)):
                     nwp = route[(idx + 1) % len(route)]
@@ -633,18 +672,18 @@ def collect_distillation_data():
 
                 fwd_vel = vec3(vehicle.get_velocity())
                 wp_fwd  = vec3(cur_wp.transform.rotation.get_forward_vector())
-                ang     = angle_diff(fwd_vel, wp_fwd)   # radians
+                ang     = angle_diff(fwd_vel, wp_fwd)
 
-                # ── STEP 5: GREEN LIGHT OVERRIDE ──────────────────────────────
-                # Identical to main.py — override red lights to green
+                # ── STEP 6: GREEN LIGHT OVERRIDE ──────────────────────────────
                 if vehicle.is_at_traffic_light():
                     tl = vehicle.get_traffic_light()
                     if tl.get_state() == carla.TrafficLightState.Red:
                         tl.set_state(carla.TrafficLightState.Green)
 
-                # ── STEP 6: TEACHER INFERENCE ─────────────────────────────────
-                # Simulator is FROZEN here while Qwen-VL thinks (~1-2 s).
-                # All 5 PDF vehicle state inputs are passed to the teacher.
+                # ── STEP 7: QWEN-VL TEACHER LABELLING ────────────────────────
+                # Simulator is FROZEN here while Qwen-VL thinks (~10s).
+                # Teacher sees the frame and outputs what the CORRECT
+                # action should be. This is the label — NOT applied to car.
                 collision_flag = len(col_sens.collision_data) > 0
                 try:
                     action_label, (t_steer, t_throttle_raw), reason = \
@@ -653,35 +692,27 @@ def collect_distillation_data():
                             velocity             = velocity,
                             distance_from_center = dist_from_center,
                             angle                = ang,
-                            steering_angle       = steer_smooth,     # PDF: steering angle
-                            throttle             = throttle_smooth,   # PDF: throttle value
-                            nav_command          = NAV_COMMAND,       # PDF: nav command
+                            steering_angle       = autopilot_steer,
+                            throttle             = autopilot_throttle,
+                            nav_command          = NAV_COMMAND,
                             collision_occurred   = collision_flag,
                         )
                 except Exception as e:
-                    logger.warning(f"Ep{episode} frame{frame_idx}: teacher error: {e} → fallback")
+                    logger.warning(
+                        f"Ep{episode} frame{frame_idx}: teacher error: {e}")
                     action_label   = 'go_straight'
                     t_steer        = 0.0
                     t_throttle_raw = 0.6
                     reason         = 'teacher_error_fallback'
 
-                # ── STEP 7: APPLY TEACHER ACTION ──────────────────────────────
-                # Exponential smoothing — identical to main.py step()
-                # steer ∈ [-1, 1]
-                # actual_throttle = (throttle_raw + 1) / 2  ∈ [0, 1]
-                steer_clipped   = float(np.clip(t_steer, -1.0, 1.0))
-                throttle_actual = float(np.clip((t_throttle_raw + 1.0) / 2.0, 0.0, 1.0))
+                # ── STEP 8: CHECK TEACHER-AUTOPILOT AGREEMENT ─────────────────
+                # Did teacher's label match what autopilot actually did?
+                agreed = check_agreement(action_label, autopilot_steer)
+                agree_count += agreed
 
-                steer_smooth    = steer_smooth    * 0.9 + steer_clipped   * 0.1
-                throttle_smooth = throttle_smooth * 0.9 + throttle_actual * 0.1
-
-                vehicle.apply_control(carla.VehicleControl(
-                    steer    = steer_smooth,
-                    throttle = throttle_smooth,
-                ))
-
-                # ── STEP 8: COMPUTE REWARD ────────────────────────────────────
-                # Identical formula to main.py step()
+                # ── STEP 9: COMPUTE REWARD ────────────────────────────────────
+                # Autopilot drives well so reward is usually high.
+                # Frames with reward < 0 are filtered during imitation learning.
                 reward, done, term_reason = compute_reward(
                     velocity           = velocity,
                     dist_from_center   = dist_from_center,
@@ -693,49 +724,53 @@ def collect_distillation_data():
                 if done:
                     termination_reason = term_reason
 
-                # ── STEP 9: SAVE FRAME AS PNG ─────────────────────────────────
-                # Raw semantic-seg image saved as-is (BGR).
-                # Student encoder (CLIP/DINOv2) will load and convert during IL.
+                # ── STEP 10: SAVE FRAME AS PNG ────────────────────────────────
                 frame_name = f"frame_{frame_idx:04d}.png"
                 frame_path = os.path.join(ep_img_dir, frame_name)
                 cv2.imwrite(frame_path, image_array)
 
-                # ── STEP 10: WRITE CSV ROW ────────────────────────────────────
-                # teacher_steer and teacher_throttle_raw are the LABELS
-                # that imitation learning will train the student to reproduce.
+                # ── STEP 11: WRITE CSV ROW ────────────────────────────────────
                 step_time = time.time() - step_t0
                 row = [
                     # identifiers
-                    f"frame_{frame_idx:04d}",      # frame_id
-                    frame_path,                     # image_path
+                    f"frame_{frame_idx:04d}",        # frame_id
+                    frame_path,                       # image_path
 
-                    # INPUT columns — student receives these at inference
-                    round(velocity,          3),    # velocity_kmh
-                    round(dist_from_center,  4),    # dist_from_center
-                    round(ang,               6),    # angle_rad
-                    round(steer_smooth,      4),    # steering_angle
-                    round(throttle_smooth,   4),    # throttle
-                    NAV_COMMAND,                    # nav_command
+                    # INPUT columns — student receives at inference
+                    round(velocity,           3),     # velocity_kmh
+                    round(dist_from_center,   4),     # dist_from_center
+                    round(ang,                6),     # angle_rad
+                    round(autopilot_steer,    4),     # steering_angle
+                    round(autopilot_throttle, 4),     # throttle
+                    NAV_COMMAND,                      # nav_command
 
                     # LABEL columns — imitation learning target
-                    action_label,                   # teacher_action_label
-                    round(t_steer,           4),    # teacher_steer
-                    round(t_throttle_raw,    4),    # teacher_throttle_raw
-                    reason[:150],                   # teacher_reason
+                    action_label,                     # teacher_action_label
+                    round(t_steer,            4),     # teacher_steer
+                    round(t_throttle_raw,     4),     # teacher_throttle_raw
+                    reason[:150],                     # teacher_reason
+
+                    # AUTOPILOT columns — what actually drove
+                    round(autopilot_steer,    4),     # autopilot_steer
+                    round(autopilot_throttle, 4),     # autopilot_throttle
 
                     # FEEDBACK columns
-                    round(reward,            4),    # reward
-                    int(done),                      # done
-                    round(step_time,         4),    # step_time_s
+                    round(reward,             4),     # reward
+                    int(done),                        # done
+                    agreed,                           # teacher_agree
+                    round(step_time,          4),     # step_time_s
                 ]
                 append_frame_row(ep_csv_path, row)
 
-                # ── STEP 11: LOG PROGRESS ─────────────────────────────────────
+                # ── STEP 12: LOG PROGRESS ─────────────────────────────────────
                 if frame_idx % 50 == 0 or done:
+                    agree_pct = (agree_count / max(frame_idx + 1, 1)) * 100
                     logger.info(
                         f"  Ep{episode:02d} | f={frame_idx:04d} | "
                         f"vel={velocity:5.1f} | dist={dist_from_center:.2f}m | "
-                        f"label={action_label:<22} | r={reward:+.3f} | t={step_time:.1f}s")
+                        f"label={action_label:<22} | "
+                        f"agree={agree_pct:.0f}% | "
+                        f"r={reward:+.3f} | t={step_time:.1f}s")
 
                 if done:
                     logger.info(f"  Episode ended: {term_reason}")
@@ -744,39 +779,44 @@ def collect_distillation_data():
             # ══════════════════════════════════════════════════════════════════
             # END OF EPISODE
             # ══════════════════════════════════════════════════════════════════
-            ep_time      = time.time() - ep_start_time
-            n_frames     = frame_idx + 1
-            avg_lane_dev = lane_dev_accum / max(n_frames, 1)
+            ep_time       = time.time() - ep_start_time
+            n_frames      = frame_idx + 1
+            avg_lane_dev  = lane_dev_accum / max(n_frames, 1)
+            agree_pct     = (agree_count / max(n_frames, 1)) * 100
 
             logger.info(
-                f"\n  Ep{episode:02d} done | frames={n_frames} | "
+                f"\n  Ep{episode:02d} complete | "
+                f"frames={n_frames} | "
                 f"reward={total_reward:.2f} | "
                 f"lane_dev={avg_lane_dev:.3f}m | "
-                f"time={ep_time:.1f}s | reason={termination_reason}")
+                f"teacher_agreement={agree_pct:.1f}% | "
+                f"time={ep_time:.1f}s | "
+                f"reason={termination_reason}")
 
             write_summary_row({
-                'episode':             episode,
-                'total_frames':        n_frames,
-                'total_reward':        round(total_reward,  3),
-                'avg_reward_per_frame':round(total_reward / max(n_frames, 1), 4),
-                'waypoints_covered':   wp_index,
-                'avg_lane_deviation_m':round(avg_lane_dev,  4),
-                'wall_time_s':         round(ep_time,        2),
-                'termination_reason':  termination_reason,
-                'episode_csv_path':    ep_csv_path,
+                'episode':               episode,
+                'total_frames':          n_frames,
+                'total_reward':          round(total_reward,  3),
+                'avg_reward_per_frame':  round(total_reward / max(n_frames, 1), 4),
+                'waypoints_covered':     wp_index,
+                'avg_lane_deviation_m':  round(avg_lane_dev,  4),
+                'teacher_agreement_pct': round(agree_pct,      1),
+                'wall_time_s':           round(ep_time,         2),
+                'termination_reason':    termination_reason,
+                'episode_csv_path':      ep_csv_path,
             })
 
-            # clean up this episode's ego vehicle and sensors
+            # ── clean up ego vehicle and sensors ──────────────────────────────
             front_cam.destroy()
             col_sens.destroy()
             if disp_cam:
                 disp_cam.destroy()
             vehicle.destroy()
-            world.tick()   # one tick so CARLA processes the destructions
+            world.tick()
 
-    # ── SynchronousMode.__exit__ restores async mode here ─────────────────────
+    # ── restore async mode (SynchronousMode.__exit__) ─────────────────────────
 
-    # tear down persistent NPCs and pedestrians
+    # ── tear down NPCs and pedestrians ────────────────────────────────────────
     logger.info("Cleaning up NPCs and pedestrians…")
     client.apply_batch(
         [carla.command.DestroyActor(x) for x in npc_ids + walker_ids])
