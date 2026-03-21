@@ -1,14 +1,16 @@
 # blip_encoder.py
-# BLIP-1 semantic embedding encoder — Python 3.7 compatible.
+# BLIP-1 semantic embedding encoder — Python 3.7, transformers==4.30.2
 #
-# Model:  Salesforce/blip-image-captioning-large
-# Output: 768-dim float32 embedding (L2 normalised)
-# VRAM:   ~400MB fp32  /  ~200MB fp16
+# FIX: In transformers 4.30.2, BlipForConditionalGeneration does NOT
+# have a 'text_encoder' attribute. The BERT backbone is accessed via:
+#   model.text_decoder.bert
 #
-# Compatible with:
-#   Python      3.7.x
-#   torch       1.13.1
-#   transformers 4.35.2
+# Pipeline:
+#   1. ViT image encoder        -> image features
+#   2. BLIP text_decoder        -> generate caption
+#   3. Tokenizer                -> token ids
+#   4. text_decoder.bert        -> contextual hidden states (seq x 768)
+#   5. Mean pool + L2 norm      -> 768-dim float32 embedding
 
 import numpy as np
 import torch
@@ -26,15 +28,7 @@ from parameters import (
 class BLIPEncoder:
     """
     Wraps Salesforce BLIP-1 to produce 768-dim semantic embeddings.
-    Same model used for training AND edge inference — no distribution shift.
-
-    Pipeline
-    --------
-    1. ViT image encoder      -> image features
-    2. BLIP LLM decoder       -> caption text
-    3. BERT tokenizer         -> token ids
-    4. BLIP text encoder      -> hidden states (seq x 768)
-    5. Mean pool + L2 norm    -> 768-dim float32
+    Compatible with transformers==4.30.2 and Python 3.7.
     """
 
     def __init__(self):
@@ -50,18 +44,23 @@ class BLIPEncoder:
         ).to(self.device)
         self.model.eval()
 
+        # Verify the correct attribute exists
+        assert hasattr(self.model, 'text_decoder'), (
+            "Expected model.text_decoder — wrong transformers version?")
+        assert hasattr(self.model.text_decoder, 'bert'), (
+            "Expected model.text_decoder.bert — wrong BLIP version?")
+
+        print("[BLIPEncoder] Ready. Using text_decoder.bert for embeddings.")
+
         # LRU-style cache {hash: np.ndarray(768,)}
         self._cache = {}
         self._last_embedding = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
-
-        print("[BLIPEncoder] Ready.")
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #
     # ------------------------------------------------------------------ #
 
     def get_embedding(self, image_rgb):
-        # type: (np.ndarray) -> np.ndarray
         """
         Parameters
         ----------
@@ -81,7 +80,7 @@ class BLIPEncoder:
             print("[BLIPEncoder] inference error: {}".format(exc))
             embedding = self._last_embedding.copy()
 
-        # Evict oldest entry when cache is full
+        # Evict oldest when cache full
         if len(self._cache) >= BLIP_CACHE_SIZE:
             self._cache.pop(next(iter(self._cache)))
 
@@ -97,11 +96,10 @@ class BLIPEncoder:
     # ------------------------------------------------------------------ #
 
     def _encode(self, image_rgb):
-        # type: (np.ndarray) -> np.ndarray
         pil_image = Image.fromarray(
             image_rgb.astype(np.uint8)).convert("RGB")
 
-        # Step 1 & 2: generate caption
+        # ── Step 1 & 2: generate caption ──────────────────────────────
         inputs = self.processor(
             images=pil_image,
             text="Describe the road condition and its surroundings:",
@@ -119,7 +117,7 @@ class BLIPEncoder:
         caption = self.processor.decode(
             output_ids[0], skip_special_tokens=True)
 
-        # Step 3 & 4: encode caption -> hidden states
+        # ── Step 3: tokenize caption ───────────────────────────────────
         text_inputs = self.processor.tokenizer(
             caption,
             padding="max_length",
@@ -128,17 +126,20 @@ class BLIPEncoder:
             return_tensors="pt",
         ).to(self.device)
 
+        # ── Step 4: get hidden states via text_decoder.bert ───────────
+        # In transformers 4.30.2 BLIP-1, the BERT backbone sits at
+        # model.text_decoder.bert  (NOT model.text_encoder)
         with torch.no_grad():
-            text_outputs = self.model.text_encoder(
+            bert_outputs = self.model.text_decoder.bert(
                 input_ids=text_inputs["input_ids"],
                 attention_mask=text_inputs["attention_mask"],
                 return_dict=True,
             )
 
-        # Step 5: mean pool over tokens -> (768,)
-        hidden    = text_outputs.last_hidden_state           # (1, seq, 768)
+        # ── Step 5: mean pool over valid tokens -> (768,) ─────────────
+        hidden    = bert_outputs.last_hidden_state           # (1, seq, 768)
         mask      = text_inputs["attention_mask"].unsqueeze(-1).float()
-        embedding = (hidden * mask).sum(1) / mask.sum(1)     # (1, 768)
+        embedding = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-6)
         embedding = embedding.squeeze(0).cpu().numpy().astype(np.float32)
 
         # L2 normalise

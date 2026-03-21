@@ -137,7 +137,7 @@ class CarlaEnv(gym.Env):
 
         # Episode tracking
         self.vehicle                   = None
-        self.route_waypoints           = None
+        self.route_waypoints           = []
         self.current_waypoint_index    = 0
         self.checkpoint_waypoint_index = 0
         self.fresh_start               = True
@@ -189,6 +189,15 @@ class CarlaEnv(gym.Env):
                 self.total_distance = 500
 
             self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
+            if self.vehicle is None:
+                # Spawn point occupied — try nearby spawn points
+                spawn_points = self.map.get_spawn_points()
+                for sp in spawn_points:
+                    self.vehicle = self.world.try_spawn_actor(vehicle_bp, sp)
+                    if self.vehicle is not None:
+                        break
+            if self.vehicle is None:
+                raise RuntimeError("Failed to spawn vehicle at any spawn point")
             self.actor_list.append(self.vehicle)
 
             # ── Attach sensors ────────────────────────────────────────
@@ -305,6 +314,8 @@ class CarlaEnv(gym.Env):
             location = self.vehicle.get_location()
 
             # ── Waypoint tracking  (SmartDrive) ───────────────────────
+            if self.route_waypoints is None or len(self.route_waypoints) == 0:
+                raise RuntimeError("route_waypoints not initialised — reset() must have failed")
             wi = self.current_waypoint_index
             for _ in range(len(self.route_waypoints)):
                 nwi = wi + 1
