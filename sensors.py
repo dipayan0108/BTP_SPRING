@@ -177,8 +177,8 @@ class LiDARSensor:
         bp.set_attribute('rotation_frequency',str(self.ROTATION_FREQ))
         bp.set_attribute('upper_fov',  '0')
         bp.set_attribute('lower_fov', '-10')
-        # 180-degree horizontal sweep centred on the front
-        bp.set_attribute('horizontal_fov', '180')
+        # Note: horizontal_fov not supported in CARLA 0.9.13
+        # Full 360-degree sweep is default — we bin only 180 degrees in callback
         sensor = world.spawn_actor(
             bp,
             carla.Transform(carla.Location(x=0.0, z=2.4)),
@@ -191,20 +191,40 @@ class LiDARSensor:
         self = weak_self()
         if not self:
             return
-        # Each point: (x, y, z, intensity)
-        points = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)
+
+        raw = np.frombuffer(data.raw_data, dtype=np.float32)
+
+        # CARLA 0.9.13 LiDAR point format detection:
+        # Older CARLA versions use 3 floats per point (x, y, z)
+        # Newer versions use 4 floats per point (x, y, z, intensity)
+        # We detect based on divisibility of the raw array size.
+        n = len(raw)
+        if n == 0:
+            return
+        if n % 4 == 0:
+            points = raw.reshape(-1, 4)   # (x, y, z, intensity)
+        elif n % 3 == 0:
+            points = raw.reshape(-1, 3)   # (x, y, z) — CARLA 0.9.13
+        else:
+            # Truncate to nearest multiple of 3 as fallback
+            points = raw[:n - (n % 3)].reshape(-1, 3)
+
         if len(points) == 0:
             return
-        # Euclidean distance per point
+
+        # Euclidean distance per point (x,y plane only)
         distances = np.sqrt(points[:, 0] ** 2 + points[:, 1] ** 2)
-        # Bin into 180 angular buckets  (0° = front, ±90° = sides)
+
+        # Bin into 180 angular buckets (0deg = front, +-90deg = sides)
         angles = np.degrees(np.arctan2(points[:, 1], points[:, 0])) + 90.0
         angles = np.clip(angles, 0, 179).astype(int)
+
         range_vec = np.full(180, self.LIDAR_RANGE, dtype=np.float32)
         for i, ang in enumerate(angles):
             if distances[i] < range_vec[ang]:
                 range_vec[ang] = distances[i]
-        # Clip & normalise to [0, 1]
+
+        # Clip and normalise to [0, 1]
         range_vec = np.clip(range_vec, 0, self.LIDAR_RANGE) / self.LIDAR_RANGE
         self.range_data = range_vec
 
