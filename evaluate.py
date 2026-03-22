@@ -2,6 +2,10 @@
 # Computes all comparison metrics between SmartDrive and our system.
 # Run after training:  python evaluate.py
 #
+# FIX: env.collision_obj is None after _destroy_actors() is called on
+# episode end. Accessing .collision_data on None raised AttributeError
+# for any collision-terminated episode. Now guarded with a None check.
+#
 # Outputs:
 #   - Console summary table
 #   - Results_BLIP/evaluation/metrics.csv
@@ -39,8 +43,8 @@ SMARTDRIVE_EDGE = {
     "loop_latency_ms":  118.45,
 }
 
-NUM_TEST_EPISODES  = 100   # match BLIP-FusePPO evaluation protocol
-SCALE_PX_TO_M      = 5.0 / 235.0   # 0.02128 m/px
+NUM_TEST_EPISODES  = 100
+SCALE_PX_TO_M      = 5.0 / 235.0
 LANE_WIDTH_M       = 5.0
 
 
@@ -50,19 +54,8 @@ def set_seeds():
 
 
 def compute_metrics(records):
-    """
-    records: list of dicts, one per episode, each containing:
-        lateral_deviations_m : list of float  (per timestep)
-        distance_covered_m   : float
-        total_reward         : float
-        speeds_kmh           : list of float
-        steers               : list of float
-        done_reason          : str  (collision/lane_exit/destination/timeout)
-        inference_times_ms   : list of float
-    """
     n = len(records)
 
-    # ── Lateral deviation metrics ─────────────────────────────────
     all_devs = []
     for r in records:
         all_devs.extend(r["lateral_deviations_m"])
@@ -73,7 +66,6 @@ def compute_metrics(records):
     nrmse   = rmse / LANE_WIDTH_M
     mean_dev = float(np.mean(np.abs(all_devs)))
 
-    # ── Episode-level metrics ─────────────────────────────────────
     distances = np.array([r["distance_covered_m"] for r in records])
     rewards   = np.array([r["total_reward"]        for r in records])
     reasons   = [r["done_reason"]                  for r in records]
@@ -84,7 +76,6 @@ def compute_metrics(records):
     collision_rate  = float(sum(1 for r in reasons if r == "collision")   / n)
     lane_exit_rate  = float(sum(1 for r in reasons if r == "lane_exit")   / n)
 
-    # ── Speed metrics ─────────────────────────────────────────────
     all_speeds = []
     for r in records:
         all_speeds.extend(r["speeds_kmh"])
@@ -92,7 +83,6 @@ def compute_metrics(records):
     speed_stability = float(np.mean(np.abs(
         np.array(all_speeds) - TARGET_SPEED)))
 
-    # ── Steering smoothness ───────────────────────────────────────
     all_jerk = []
     for r in records:
         steers = r["steers"]
@@ -101,7 +91,6 @@ def compute_metrics(records):
             all_jerk.append(jerk)
     steering_jerk = float(np.mean(all_jerk)) if all_jerk else 0.0
 
-    # ── Inference time ────────────────────────────────────────────
     all_inf = []
     for r in records:
         all_inf.extend(r["inference_times_ms"])
@@ -132,7 +121,6 @@ def run_evaluation():
     print("  EVALUATION — {} episodes".format(NUM_TEST_EPISODES))
     print("="*60 + "\n")
 
-    # ── Connect to CARLA ──────────────────────────────────────────
     try:
         client, world = ClientConnection().setup()
     except ConnectionError as e:
@@ -143,7 +131,6 @@ def run_evaluation():
     model = PPO.load(PPO_MODEL_PATH, env=env)
     print("Model loaded from {}\n".format(PPO_MODEL_PATH))
 
-    # ── Run episodes ──────────────────────────────────────────────
     records = []
 
     for ep in range(1, NUM_TEST_EPISODES + 1):
@@ -165,18 +152,20 @@ def run_evaluation():
             obs, reward, done, info = env.step(action)
             ep_reward += reward
 
-            # Lateral deviation in metres
             dev_px = env._last_distance_px
             devs_m.append(abs(dev_px) * SCALE_PX_TO_M)
 
-            # Speed and steering
             speeds.append(env.velocity)
             steers.append(float(action[0]))
 
             if done:
-                # Determine termination reason
-                if len(env.collision_obj.collision_data
-                       if env.collision_obj else []) > 0:
+                # FIX: collision_obj is None after _destroy_actors() —
+                # guard with None check to avoid AttributeError
+                col_data = (
+                    env.collision_obj.collision_data
+                    if env.collision_obj is not None else []
+                )
+                if len(col_data) > 0:
                     done_reason = "collision"
                 elif abs(dev_px) > 85:
                     done_reason = "lane_exit"
@@ -185,8 +174,7 @@ def run_evaluation():
                     done_reason = "destination"
                 break
 
-        dist_m = info.get("distance_covered", 0) * 1.0  # already metres
-        # Convert waypoint count to metres (1 waypoint = 1m spacing)
+        dist_m = info.get("distance_covered", 0) * 1.0
 
         records.append({
             "lateral_deviations_m": devs_m,
@@ -206,10 +194,8 @@ def run_evaluation():
 
     env.close()
 
-    # ── Compute metrics ───────────────────────────────────────────
     metrics = compute_metrics(records)
 
-    # ── Save to CSV ───────────────────────────────────────────────
     save_dir = os.path.join(RESULTS_PATH, "evaluation")
     os.makedirs(save_dir, exist_ok=True)
 
@@ -220,8 +206,7 @@ def run_evaluation():
                          "smartdrive_gpu", "smartdrive_edge"])
         rows = [
             ("rmse_m",           metrics["rmse_m"],
-             SMARTDRIVE_GPU.get("rmse_m", "N/A"),
-             "N/A"),
+             SMARTDRIVE_GPU.get("rmse_m", "N/A"), "N/A"),
             ("std_dev_m",        metrics["std_dev_m"],       "N/A", "N/A"),
             ("nrmse",            metrics["nrmse"],           "N/A", "N/A"),
             ("mean_distance_m",  metrics["mean_distance_m"],
@@ -245,7 +230,6 @@ def run_evaluation():
         writer.writerows(rows)
     print("\nCSV saved to {}".format(csv_path))
 
-    # ── Print summary table ───────────────────────────────────────
     summary_path = os.path.join(save_dir, "metrics_summary.txt")
     lines = []
     lines.append("\n" + "="*70)
@@ -291,7 +275,6 @@ def run_evaluation():
 
     lines.append("="*70)
 
-    # Improvement over SmartDrive GPU
     if isinstance(SMARTDRIVE_GPU.get("rmse_m"), float):
         rmse_improv = (SMARTDRIVE_GPU["rmse_m"] - metrics["rmse_m"]) \
                       / SMARTDRIVE_GPU["rmse_m"] * 100

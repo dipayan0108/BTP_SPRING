@@ -2,6 +2,10 @@
 # CARLA sensor classes adapted from SmartDrive.
 # Includes: CameraSensor (semantic segmentation), CameraSensorEnv
 #           (third-person RGB display), CollisionSensor, LiDARSensor.
+#
+# FIX: CameraSensor._callback() now caps front_camera buffer at 2 frames.
+# Previously it grew unboundedly — at 20 FPS with slow BLIP inference,
+# frames accumulated and caused memory growth (~38KB per frame).
 
 import math
 import weakref
@@ -23,10 +27,13 @@ class CameraSensor:
     These are fed directly into BLIP for semantic embedding extraction.
     """
 
+    # FIX: cap ring buffer to prevent unbounded memory growth
+    MAX_BUFFER = 2
+
     def __init__(self, vehicle):
         self.sensor_name = 'sensor.camera.semantic_segmentation'
         self.parent       = vehicle
-        self.front_camera = []          # ring buffer; pop(-1) to read latest
+        self.front_camera = []
         world             = self.parent.get_world()
         self.sensor       = self._setup(world)
         weak_self         = weakref.ref(self)
@@ -55,6 +62,9 @@ class CameraSensor:
         image.convert(carla.ColorConverter.CityScapesPalette)
         buf = np.frombuffer(image.raw_data, dtype=np.uint8)
         buf = buf.reshape((image.height, image.width, 4))
+        # FIX: evict oldest frame when buffer is full
+        if len(self.front_camera) >= CameraSensor.MAX_BUFFER:
+            self.front_camera.pop(0)
         self.front_camera.append(buf[:, :, :3])   # drop alpha → (H, W, 3)
 
 
@@ -70,6 +80,7 @@ class CameraSensorEnv:
         self.display = pygame.display.set_mode(
             (600, 600), pygame.HWSURFACE | pygame.DOUBLEBUF
         )
+        pygame.display.set_caption("BLIP-FusePPO — CARLA Live View")
         self.sensor_name = 'sensor.camera.rgb'
         self.parent       = vehicle
         self.surface      = None
@@ -174,11 +185,12 @@ class LiDARSensor:
         bp.set_attribute('channels',          str(self.NUM_CHANNELS))
         bp.set_attribute('range',             str(self.LIDAR_RANGE))
         bp.set_attribute('points_per_second', str(self.POINTS_PER_SEC))
-        bp.set_attribute('rotation_frequency',str(self.ROTATION_FREQ))
+        bp.set_attribute('rotation_frequency', str(self.ROTATION_FREQ))
         bp.set_attribute('upper_fov',  '0')
         bp.set_attribute('lower_fov', '-10')
-        # Note: horizontal_fov not supported in CARLA 0.9.13
-        # Full 360-degree sweep is default — we bin only 180 degrees in callback
+        # NOTE: 'horizontal_fov' is NOT supported in CARLA 0.9.13 and below.
+        # The full 360° sweep is used and filtered to the front 180° arc
+        # in _callback() by keeping only points where x > 0 (forward half).
         sensor = world.spawn_actor(
             bp,
             carla.Transform(carla.Location(x=0.0, z=2.4)),
@@ -192,41 +204,50 @@ class LiDARSensor:
         if not self:
             return
 
-        raw = np.frombuffer(data.raw_data, dtype=np.float32)
-
-        # CARLA 0.9.13 LiDAR point format detection:
-        # Older CARLA versions use 3 floats per point (x, y, z)
-        # Newer versions use 4 floats per point (x, y, z, intensity)
-        # We detect based on divisibility of the raw array size.
-        n = len(raw)
+        # ── Parse point cloud ─────────────────────────────────────────
+        # CARLA 0.9.x on Windows returns raw_data that is NOT a simple
+        # float32 buffer (sizes are not 16-byte aligned). The reliable
+        # cross-platform approach is to iterate the measurement object
+        # directly using CARLA's own point accessor, then build numpy
+        # arrays from the extracted x/y/z values.
+        n = len(data)   # number of LidarDetection points
         if n == 0:
             return
-        if n % 4 == 0:
-            points = raw.reshape(-1, 4)   # (x, y, z, intensity)
-        elif n % 3 == 0:
-            points = raw.reshape(-1, 3)   # (x, y, z) — CARLA 0.9.13
-        else:
-            # Truncate to nearest multiple of 3 as fallback
-            points = raw[:n - (n % 3)].reshape(-1, 3)
 
-        if len(points) == 0:
+        xs = np.empty(n, dtype=np.float32)
+        ys = np.empty(n, dtype=np.float32)
+
+        for i, detection in enumerate(data):
+            # In CARLA 0.9.13, iterating a LidarMeasurement yields
+            # carla.Location objects directly — no .point wrapper.
+            xs[i] = detection.x
+            ys[i] = detection.y
+
+        # ── Filter to front 180° arc (x > 0 = forward half) ──────────
+        front = xs > 0
+        xs = xs[front]
+        ys = ys[front]
+
+        if len(xs) == 0:
+            self.range_data = np.ones(180, dtype=np.float32)
             return
 
-        # Euclidean distance per point (x,y plane only)
-        distances = np.sqrt(points[:, 0] ** 2 + points[:, 1] ** 2)
+        distances = np.sqrt(xs ** 2 + ys ** 2)
 
-        # Bin into 180 angular buckets (0deg = front, +-90deg = sides)
-        angles = np.degrees(np.arctan2(points[:, 1], points[:, 0])) + 90.0
-        angles = np.clip(angles, 0, 179).astype(int)
+        # Map angle to bucket 0–179
+        # arctan2(y, x) gives -90° (right) to +90° (left); shift to 0–179
+        angles_deg = np.degrees(np.arctan2(ys, xs))
+        buckets = np.clip(
+            ((angles_deg + 90.0) / 180.0 * 179).astype(int), 0, 179
+        )
 
         range_vec = np.full(180, self.LIDAR_RANGE, dtype=np.float32)
-        for i, ang in enumerate(angles):
-            if distances[i] < range_vec[ang]:
-                range_vec[ang] = distances[i]
+        for i, b in enumerate(buckets):
+            if distances[i] < range_vec[b]:
+                range_vec[b] = distances[i]
 
-        # Clip and normalise to [0, 1]
-        range_vec = np.clip(range_vec, 0, self.LIDAR_RANGE) / self.LIDAR_RANGE
-        self.range_data = range_vec
+        # Normalise to [0, 1]
+        self.range_data = np.clip(range_vec, 0, self.LIDAR_RANGE) / self.LIDAR_RANGE
 
 
 # ═══════════════════════════════════════════════════════════════════════ #
