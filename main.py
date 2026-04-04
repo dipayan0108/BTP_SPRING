@@ -64,9 +64,11 @@ def train():
     os.makedirs(PPO_MODEL_PATH,  exist_ok=True)
 
     # ── SB3 PPO model ─────────────────────────────────────────────────
-    if CHECKPOINT_LOAD:
-        # Auto-find the latest checkpoint in CHECKPOINT_PATH
-        # Files are named: rl_model_<steps>_steps.zip
+    # Use a local flag — never reassign the imported constant, which
+    # causes Python's "referenced before assignment" error.
+    loading_checkpoint = CHECKPOINT_LOAD
+
+    if loading_checkpoint:
         import glob as _glob
         ckpt_files = sorted(
             _glob.glob(os.path.join(CHECKPOINT_PATH, 'rl_model_*_steps.zip')),
@@ -77,10 +79,9 @@ def train():
             else None
         )
         if load_path is None:
-            print("CHECKPOINT_LOAD=True but no checkpoint or model found — starting fresh.")
-            load_path = None
-
-        if load_path:
+            print("CHECKPOINT_LOAD=True but no checkpoint found — starting fresh.")
+            loading_checkpoint = False
+        else:
             print(f"Resuming from checkpoint: {load_path}")
             model = PPO.load(
                 load_path,
@@ -88,9 +89,8 @@ def train():
                 tensorboard_log=LOG_PATH_TRAIN,
             )
             print("Checkpoint loaded.")
-        else:
-            CHECKPOINT_LOAD = False   # fall through to fresh model below
-    if not CHECKPOINT_LOAD:
+
+    if not loading_checkpoint:
         print("Creating new PPO model ...")
         model = PPO(
             policy            = "MultiInputPolicy",
@@ -144,7 +144,7 @@ def train():
     model.learn(
         total_timesteps     = int(TRAIN_TIMESTEPS),
         callback            = callbacks,
-        reset_num_timesteps = not CHECKPOINT_LOAD,
+        reset_num_timesteps = not loading_checkpoint,
         tb_log_name         = "BLIP_FusePPO",
         progress_bar        = True,
     )

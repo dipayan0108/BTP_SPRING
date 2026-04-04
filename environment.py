@@ -5,14 +5,8 @@
 #   BLIP-FusePPO → Dict observation space, BLIP state,
 #                  LiDAR, PID, hybrid reward, symmetric augmentation
 #
-# FIXES APPLIED:
-#   1. Sensor leak: sensor.stop() called before destroy
-#   2. Walker ghost: walkers properly stopped and destroyed on reset
-#   3. Camera buffer: capped at 2 frames to prevent memory growth
-#   4. Augmentation: removed from step() — was corrupting SB3 rollout buffer
-#   5. BLIP embedding: now included in obs dict under OBS_KEY_BLIP
-#   6. PID double-advance: _last_pid_val cached, reused in aug obs
-#   7. Aug obs: kept as a helper for external use but NOT injected into step()
+# Returns Dict obs compatible with SB3 MultiInputPolicy.
+# Internal vehicle bookkeeping uses plain numpy (no TF dependency here).
 
 import os
 import sys
@@ -44,8 +38,8 @@ from reward       import compute_reward
 from parameters   import (
     IM_HEIGHT, IM_WIDTH,
     LIDAR_DIM, PID_DIM, NAV_DIM,
-    OBS_KEY_IMAGE, OBS_KEY_LIDAR, OBS_KEY_PID, OBS_KEY_NAV, OBS_KEY_BLIP,
     BLIP_EMBEDDING_DIM,
+    OBS_KEY_IMAGE, OBS_KEY_BLIP, OBS_KEY_LIDAR, OBS_KEY_PID, OBS_KEY_NAV,
     TOWN, CAR_NAME, NUMBER_OF_PEDESTRIAN, VISUAL_DISPLAY,
     MAX_SPEED, MIN_SPEED, TARGET_SPEED,
     BLIP_UPDATE_INTERVAL,
@@ -88,10 +82,10 @@ class CarlaEnv(gym.Env):
 
     Observation space  (Dict):
         image          → (IM_HEIGHT, IM_WIDTH, 3)  float32  [0, 1]
+        blip           → (768,)                    float32          ← NEW
         lidar          → (180,)                    float32  [0, 1]
         pid_correction → (1,)                      float32
         navigation     → (5,)                      float32
-        blip           → (768,)                    float32  (BLIP semantic embedding)
 
     Action space:
         Box(-1, 1, (2,))  →  [steer, throttle_raw]
@@ -114,15 +108,15 @@ class CarlaEnv(gym.Env):
         self.observation_space = spaces.Dict({
             OBS_KEY_IMAGE: spaces.Box(
                 0.0, 1.0, (IM_HEIGHT, IM_WIDTH, 3), dtype=np.float32),
+            # BLIP semantic embedding — L2-normalised, values in [-1, 1]
+            OBS_KEY_BLIP: spaces.Box(
+                -1.0, 1.0, (BLIP_EMBEDDING_DIM,), dtype=np.float32),  # ← NEW
             OBS_KEY_LIDAR: spaces.Box(
                 0.0, 1.0, (LIDAR_DIM,), dtype=np.float32),
             OBS_KEY_PID: spaces.Box(
                 -1.0, 1.0, (PID_DIM,), dtype=np.float32),
             OBS_KEY_NAV: spaces.Box(
                 -np.inf, np.inf, (NAV_DIM,), dtype=np.float32),
-            # FIX #5: BLIP embedding now included in obs space
-            OBS_KEY_BLIP: spaces.Box(
-                -np.inf, np.inf, (BLIP_EMBEDDING_DIM,), dtype=np.float32),
         })
         self.action_space = spaces.Box(
             -1.0, 1.0, (2,), dtype=np.float32)
@@ -132,7 +126,6 @@ class CarlaEnv(gym.Env):
         self.env_camera_obj = None
         self.collision_obj  = None
         self.lidar_obj      = None
-        self.collision_history = []   # safe default — never unbound
         self.sensor_list    = []
         self.actor_list     = []
         self.walker_list    = []
@@ -142,12 +135,13 @@ class CarlaEnv(gym.Env):
         self.pid          = PIDController()
 
         # BLIP caching
+        # _last_blip_emb  : embedding for the current (non-augmented) frame
+        # _last_aug_blip  : embedding for the horizontally flipped frame
+        # Both are refreshed every BLIP_UPDATE_INTERVAL steps.
         self._frame_counter  = 0
         self._last_blip_emb  = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
         self._last_aug_blip  = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
         self._last_image_rgb = None
-        # FIX #6: cache PID value so aug obs doesn't re-advance the integrator
-        self._last_pid_val   = 0.0
 
         # Episode tracking
         self.vehicle                   = None
@@ -171,6 +165,10 @@ class CarlaEnv(gym.Env):
         self._lidar_below_count  = 0
         self._lidar_window_steps = 0
 
+        # Augmentation phase flag (BLIP-FusePPO alternating step logic)
+        self._aug_phase             = 0
+        self._last_aug_transition   = None
+
         self._create_pedestrians()
 
     # ------------------------------------------------------------------ #
@@ -184,7 +182,12 @@ class CarlaEnv(gym.Env):
             self._frame_counter      = 0
             self._lidar_below_count  = 0
             self._lidar_window_steps = 0
-            self._last_pid_val       = 0.0
+            self._aug_phase          = 0
+
+            # Reset cached BLIP embeddings so the first obs isn't stale
+            self._last_blip_emb  = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
+            self._last_aug_blip  = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
+            self._last_image_rgb = None
 
             # ── Spawn vehicle ─────────────────────────────────────────
             vehicle_bp = self._get_vehicle_bp(CAR_NAME)
@@ -279,10 +282,9 @@ class CarlaEnv(gym.Env):
 
     def step(self, action):
         """
-        FIX #4: Removed augmentation phase logic entirely.
-        SB3 expects exactly one real (obs, reward, done, info) per action.
-        The previous alternating-phase logic injected fabricated transitions
-        into the rollout buffer, corrupting PPO training.
+        Implements BLIP-FusePPO's alternating augmentation phase:
+          phase=0 → execute action, return original obs
+          phase=1 → return stored augmented transition
 
         Returns
         -------
@@ -292,6 +294,11 @@ class CarlaEnv(gym.Env):
         info   : dict
         """
         try:
+            # ── Augmented phase  (BLIP-FusePPO) ──────────────────────
+            if self._aug_phase == 1:
+                self._aug_phase = 0
+                return self._last_aug_transition
+
             # ── Apply action ─────────────────────────────────────────
             self.timesteps      += 1
             self.fresh_start     = False
@@ -315,10 +322,6 @@ class CarlaEnv(gym.Env):
             # ── Vehicle state ─────────────────────────────────────────
             vel           = self.vehicle.get_velocity()
             self.velocity = math.sqrt(vel.x**2 + vel.y**2 + vel.z**2) * 3.6
-            # Guard: collision_obj may be None if _destroy_actors() was
-            # called at the end of the previous episode before reset()
-            if self.collision_obj is None:
-                return self._blank_obs(), REWARD_FAIL, True, {}
             self.collision_history = self.collision_obj.collision_data
             location = self.vehicle.get_location()
 
@@ -350,7 +353,7 @@ class CarlaEnv(gym.Env):
 
             fwd    = self._vec(self.vehicle.get_velocity())
             wp_fwd = self._vec(cur_wp.transform.rotation.get_forward_vector())
-            self.angle = self._angle_diff(fwd, wp_fwd)
+            self.angle = self._signed_angle_diff(fwd, wp_fwd)
 
             # ── LiDAR min distance (metres) ───────────────────────────
             lidar_norm  = self.lidar_obj.range_data       # (180,) in [0,1]
@@ -401,12 +404,15 @@ class CarlaEnv(gym.Env):
             reward = compute_reward(distance_px, min_lidar_m,
                                     self.velocity, failed)
 
-            # ── Build observation ─────────────────────────────────────
+            # ── Build original observation ────────────────────────────
             obs = self._build_obs()
 
-            # Pump pygame so the display window stays responsive
-            if self.display_on:
-                self.render()
+            # ── Build augmented transition  (BLIP-FusePPO) ────────────
+            aug_obs    = self._build_aug_obs()
+            aug_action = np.array([-action[0], action[1]], dtype=np.float32)
+            self._last_aug_transition = (aug_obs, reward, done,
+                                         {"augmented_action": aug_action})
+            self._aug_phase = 1   # next call returns augmented
 
             if done:
                 self.center_lane_deviation /= max(self.timesteps, 1)
@@ -414,9 +420,10 @@ class CarlaEnv(gym.Env):
                     self.current_waypoint_index
                     - self.checkpoint_waypoint_index)
                 self._destroy_actors()
+                self._aug_phase = 0   # reset on episode end
 
             info = {
-                "distance_covered":      self.distance_covered,
+                "distance_covered":    self.distance_covered,
                 "center_lane_deviation": self.center_lane_deviation,
             }
             return obs, reward, done, info
@@ -432,9 +439,12 @@ class CarlaEnv(gym.Env):
 
     def _build_obs(self) -> dict:
         """
-        Returns the Dict observation.
-        FIX #5: BLIP embedding included under OBS_KEY_BLIP.
-        FIX #6: PID value cached in self._last_pid_val.
+        Returns the normal (non-augmented) Dict observation.
+
+        BLIP embedding is refreshed every BLIP_UPDATE_INTERVAL frames;
+        between refreshes the cached embedding is reused.  This matches
+        the original design intent and avoids the previous bug where the
+        embedding was computed but never added to the returned dict.
         """
         while len(self.camera_obj.front_camera) == 0:
             time.sleep(0.0001)
@@ -444,40 +454,53 @@ class CarlaEnv(gym.Env):
         # Normalise image to [0,1]
         image_norm = image_rgb.astype(np.float32) / 255.0   # (H,W,3)
 
-        # BLIP embedding — refresh every K frames
+        # ── BLIP semantic embedding ───────────────────────────────────
+        # Refresh every K frames; reuse cache otherwise to save latency.
         if self._frame_counter % BLIP_UPDATE_INTERVAL == 0:
             self._last_blip_emb = self.blip_encoder.get_embedding(image_rgb)
+        blip_emb = self._last_blip_emb.copy()               # (768,) float32
 
         # LiDAR  (180,) already in [0,1]
         lidar_vec = self.lidar_obj.range_data.copy()
 
-        # PID correction — cache value so aug obs can reuse without re-advancing
+        # PID correction
         pid_val = self.pid.compute(self._last_distance_px / 100.0)
         pid_val = float(np.clip(pid_val, -1.0, 1.0))
-        self._last_pid_val = pid_val  # FIX #6
 
-        # Navigation obs  (SmartDrive 5-dim)
-        norm_vel   = self.velocity / max(TARGET_SPEED, 1e-6)
-        norm_dist  = self.distance_from_center / 3.0
-        norm_angle = abs(self.angle / np.deg2rad(20))
-        nav_vec    = np.array(
-            [self.throttle, self.velocity, norm_vel, norm_dist, norm_angle],
+        # ── Navigation obs — exact SmartDrive 5-dim vector ───────────
+        # Order and normalisation taken directly from the SmartDrive paper:
+        #   [throttle, velocity, normalized_velocity,
+        #    normalized_distance_from_center, normalized_angle]
+        normalized_velocity             = self.velocity / max(TARGET_SPEED, 1e-6)
+        normalized_distance_from_center = self.distance_from_center / 3.0
+        normalized_angle                = abs(self.angle) / np.deg2rad(20)
+        nav_vec = np.array(
+            [
+                self.throttle,                   # throttle          [0, 1]
+                self.velocity,                   # velocity          (km/h, raw)
+                normalized_velocity,             # velocity / target [-]
+                normalized_distance_from_center, # dist_centre / 3.0 [-]
+                normalized_angle,                # |angle| / 20°     [-]
+            ],
             dtype=np.float32,
         )
 
         return {
             OBS_KEY_IMAGE: image_norm,
+            OBS_KEY_BLIP:  blip_emb,
             OBS_KEY_LIDAR: lidar_vec,
             OBS_KEY_PID:   np.array([pid_val], dtype=np.float32),
             OBS_KEY_NAV:   nav_vec,
-            OBS_KEY_BLIP:  self._last_blip_emb.copy(),   # FIX #5
         }
 
     def _build_aug_obs(self) -> dict:
         """
-        Returns a symmetric augmented Dict observation.
-        NOTE: No longer injected into step() — kept for external / offline use.
-        FIX #6: Reuses cached _last_pid_val instead of re-advancing PID.
+        Returns the symmetric augmented Dict observation:
+            image  → horizontally flipped
+            blip   → embedding of the flipped image   ← NEW
+            lidar  → reversed (left↔right swap)
+            pid    → negated
+            nav    → unchanged
         """
         if self._last_image_rgb is None:
             return self._blank_obs()
@@ -485,38 +508,49 @@ class CarlaEnv(gym.Env):
         aug_image_rgb  = cv2.flip(self._last_image_rgb, 1)
         aug_image_norm = aug_image_rgb.astype(np.float32) / 255.0
 
-        # BLIP for augmented image
+        # ── BLIP embedding for the flipped image ──────────────────────
+        # Refresh in sync with the normal obs so they share the same
+        # update cadence.  _last_aug_blip is reused between refreshes.
         if self._frame_counter % BLIP_UPDATE_INTERVAL == 0:
             self._last_aug_blip = self.blip_encoder.get_embedding(aug_image_rgb)
+        aug_blip_emb = self._last_aug_blip.copy()           # (768,) float32
 
         aug_lidar = np.flip(self.lidar_obj.range_data.copy()).astype(np.float32)
 
-        # FIX #6: negate cached value instead of calling pid.compute() again
-        aug_pid = float(np.clip(-self._last_pid_val, -1.0, 1.0))
+        pid_val = self.pid.compute(self._last_distance_px / 100.0)
+        aug_pid = float(np.clip(-pid_val, -1.0, 1.0))
 
-        norm_vel   = self.velocity / max(TARGET_SPEED, 1e-6)
-        norm_dist  = self.distance_from_center / 3.0
-        norm_angle = abs(self.angle / np.deg2rad(20))
-        nav_vec    = np.array(
-            [self.throttle, self.velocity, norm_vel, norm_dist, norm_angle],
+        # Nav is unchanged during augmentation — telemetry is symmetric
+        # Same SmartDrive 5-dim: [throttle, velocity, norm_vel, norm_dist, norm_angle]
+        normalized_velocity             = self.velocity / max(TARGET_SPEED, 1e-6)
+        normalized_distance_from_center = self.distance_from_center / 3.0
+        normalized_angle                = abs(self.angle) / np.deg2rad(20)
+        nav_vec = np.array(
+            [
+                self.throttle,
+                self.velocity,
+                normalized_velocity,
+                normalized_distance_from_center,
+                normalized_angle,
+            ],
             dtype=np.float32,
         )
 
         return {
             OBS_KEY_IMAGE: aug_image_norm,
+            OBS_KEY_BLIP:  aug_blip_emb,
             OBS_KEY_LIDAR: aug_lidar,
             OBS_KEY_PID:   np.array([aug_pid], dtype=np.float32),
             OBS_KEY_NAV:   nav_vec,
-            OBS_KEY_BLIP:  self._last_aug_blip.copy(),
         }
 
     def _blank_obs(self) -> dict:
         return {
             OBS_KEY_IMAGE: np.zeros((IM_HEIGHT, IM_WIDTH, 3), dtype=np.float32),
-            OBS_KEY_LIDAR: np.zeros(LIDAR_DIM,          dtype=np.float32),
-            OBS_KEY_PID:   np.zeros(PID_DIM,            dtype=np.float32),
-            OBS_KEY_NAV:   np.zeros(NAV_DIM,            dtype=np.float32),
-            OBS_KEY_BLIP:  np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32),
+            OBS_KEY_BLIP:  np.zeros(BLIP_EMBEDDING_DIM,       dtype=np.float32),  # ← NEW
+            OBS_KEY_LIDAR: np.zeros(LIDAR_DIM,                dtype=np.float32),
+            OBS_KEY_PID:   np.zeros(PID_DIM,                  dtype=np.float32),
+            OBS_KEY_NAV:   np.zeros(NAV_DIM,                  dtype=np.float32),
         }
 
     # ------------------------------------------------------------------ #
@@ -616,57 +650,40 @@ class CarlaEnv(gym.Env):
             np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-6)
         return math.acos(np.clip(cos, -1.0, 1.0))
 
+    @staticmethod
+    def _signed_angle_diff(v1, v2):
+        """
+        Signed heading error between v1 (velocity) and v2 (waypoint forward).
+        Positive = vehicle heading is to the RIGHT of the waypoint direction.
+        Negative = vehicle heading is to the LEFT.
+        Uses the 2-D cross product (z-component) for sign.
+        """
+        n1 = np.linalg.norm(v1[:2])
+        n2 = np.linalg.norm(v2[:2])
+        if n1 < 1e-6 or n2 < 1e-6:
+            return 0.0
+        u1 = v1[:2] / n1
+        u2 = v2[:2] / n2
+        cos_a = float(np.clip(np.dot(u1, u2), -1.0, 1.0))
+        angle = math.acos(cos_a)
+        # cross product z-component gives handedness
+        cross = u1[0] * u2[1] - u1[1] * u2[0]
+        return angle if cross >= 0 else -angle
+
     def _destroy_actors(self):
-        """
-        FIX #1: Stop sensor listeners before destroying — prevents the
-        'sensor object went out of scope but still alive' CARLA warning
-        and the associated actor ID accumulation.
-
-        FIX #2: Walkers and their AI controllers are properly stopped
-        and destroyed to prevent ghost pedestrian accumulation across resets.
-        """
-        # Stop and destroy sensors individually
-        for sensor in self.sensor_list:
-            try:
-                if sensor is not None and sensor.is_alive:
-                    sensor.stop()
-                    sensor.destroy()
-            except Exception:
-                pass
-        self.sensor_list.clear()
-
-        # Destroy vehicle and other non-sensor actors
+        if self.sensor_list:
+            self.client.apply_batch(
+                [carla.command.DestroyActor(x) for x in self.sensor_list])
+            self.sensor_list.clear()
         if self.actor_list:
             self.client.apply_batch(
                 [carla.command.DestroyActor(x) for x in self.actor_list])
             self.actor_list.clear()
-
-        # FIX #2: Stop walker AI controllers before destroying walkers
-        if self.walker_list:
-            try:
-                actors = self.world.get_actors(self.walker_list)
-                # walker_list is [ctrl_id, walker_id, ctrl_id, walker_id, ...]
-                for i in range(0, len(actors), 2):
-                    try:
-                        actors[i].stop()   # stop AI controller
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            self.client.apply_batch(
-                [carla.command.DestroyActor(x) for x in self.walker_list])
-            self.walker_list.clear()
-
         self.camera_obj = self.env_camera_obj = None
         self.collision_obj = self.lidar_obj   = None
 
     def render(self, mode='human'):
-        # Pump pygame events so the OS doesn't mark the window as
-        # "not responding". Must be called from the main thread.
-        if self.display_on:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    self.close()
+        pass
 
     def close(self):
         self._destroy_actors()
