@@ -1,19 +1,14 @@
 # exploration_callback.py
-# Implements SmartDrive's variable exploration noise decay
-# as an SB3 BaseCallback.
+# Variable exploration noise decay — FIX-C applied.
 #
-# FIX (original): log_std was frozen (requires_grad=False) permanently
-#   after each manual decay. This prevented PPO's optimizer from ever
-#   learning the std between decay steps, effectively disabling all
-#   log_std gradient updates for the entire training run.
+# SmartDrive decays sigma every 300 episodes across 1200 total = 4 decay steps.
+# Our training budget is ~400 episodes (100k steps at current episode lengths).
+# ACTION_STD_DECAY_FREQ is now 75 in parameters.py, giving 4 decay steps
+# across our run: 0.40 → 0.35 → 0.30 → 0.25 → 0.20, reaching ~0.20 at ep 300.
 #
-# FIX (this version): log_std.requires_grad_(False) is used only as a
-#   momentary context to safely write the value. It is immediately
-#   re-enabled with requires_grad_(True) so the optimizer can continue
-#   learning the std between scheduled decay steps.
+# The requires_grad fix from the original version is preserved.
 
 import math
-import numpy as np
 import torch
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -22,21 +17,14 @@ from parameters import (
     ACTION_STD_MIN,
     ACTION_STD_DECAY,
     ACTION_STD_DECAY_FREQ,
+    BLIP_WARMUP_EPISODES,
 )
 
 
 class ExplorationDecayCallback(BaseCallback):
     """
-    Decays the policy's action std (sigma_noise) every
-    ACTION_STD_DECAY_FREQ episodes, from ACTION_STD_INIT down to
-    ACTION_STD_MIN.
-
-    Replicates SmartDrive's variable exploration noise strategy within
-    SB3's callback framework.
-
-    The decayed std is written to policy.log_std in-place without
-    permanently freezing the parameter, so PPO's optimizer can still
-    learn the std between scheduled decay events.
+    Decays policy action std every ACTION_STD_DECAY_FREQ episodes.
+    Also logs BLIP warmup status to the console.
     """
 
     def __init__(self, verbose=1):
@@ -47,15 +35,22 @@ class ExplorationDecayCallback(BaseCallback):
     def _on_training_start(self):
         self._set_action_std(self._current_std)
         if self.verbose > 0:
-            print(
-                f"[ExplorationDecay] Initial sigma_noise = {self._current_std}"
-            )
+            print(f"[ExplorationDecay] Initial sigma_noise = {self._current_std}")
+            print(f"[ExplorationDecay] BLIP bonus active after episode {BLIP_WARMUP_EPISODES}")
+            print(f"[ExplorationDecay] Decay schedule: every {ACTION_STD_DECAY_FREQ} episodes")
 
     def _on_step(self):
         dones = self.locals.get("dones", [])
-        for done in dones:
+        infos = self.locals.get("infos", [{}])
+
+        for done, info in zip(dones, infos):
             if done:
                 self._episode_count += 1
+
+                # Log BLIP activation milestone
+                ep_count = info.get("episode_count", self._episode_count)
+                if ep_count == BLIP_WARMUP_EPISODES and self.verbose > 0:
+                    print(f"\n[ExplorationDecay] BLIP reward bonus NOW ACTIVE (ep {ep_count})\n")
 
                 if (self._episode_count % ACTION_STD_DECAY_FREQ == 0
                         and self._episode_count > 0):
@@ -74,27 +69,11 @@ class ExplorationDecayCallback(BaseCallback):
         return True
 
     def _set_action_std(self, std):
-        """
-        Writes log(std) into policy.log_std in-place.
-
-        FIX: requires_grad is disabled only during the write, then
-        immediately re-enabled so PPO's optimizer can still update
-        log_std between scheduled decay steps.
-        """
         policy = self.model.policy
         if not hasattr(policy, 'log_std'):
-            if self.verbose > 0:
-                print(
-                    "[ExplorationDecay] Warning: "
-                    "policy has no log_std attribute — skipping."
-                )
             return
-
         log_std_value = float(math.log(max(std, 1e-8)))
         with torch.no_grad():
-            # Temporarily disable grad tracking to allow in-place fill
             policy.log_std.requires_grad_(False)
             policy.log_std.fill_(log_std_value)
-            # FIX: re-enable so the PPO optimizer can continue learning
-            # the std between scheduled decay steps
             policy.log_std.requires_grad_(True)
