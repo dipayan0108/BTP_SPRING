@@ -23,7 +23,7 @@ BLIP_CACHE_SIZE      = 100
 # Dict space — one key per modality
 # ─────────────────────────────────────────────
 OBS_KEY_IMAGE  = "image"           # (IM_HEIGHT, IM_WIDTH, 3) float32 [0,1]
-OBS_KEY_BLIP   = "blip"            # (768,)                   float32  ← NEW
+OBS_KEY_BLIP   = "blip"            # (768,)                   float32
 OBS_KEY_LIDAR  = "lidar"           # (180,)                   float32 [0,1]
 OBS_KEY_PID    = "pid_correction"  # (1,)                     float32
 OBS_KEY_NAV    = "navigation"      # (5,)                     float32
@@ -31,8 +31,10 @@ OBS_KEY_NAV    = "navigation"      # (5,)                     float32
 LIDAR_DIM = 180
 PID_DIM   = 1
 NAV_DIM   = 5    # SmartDrive navigation vector (exact paper definition):
-                 # [throttle, velocity, normalized_velocity,
+                 # [throttle, normalized_velocity, normalized_velocity,
                  #  normalized_distance_from_center, normalized_angle]
+                 # NOTE: raw velocity removed — all values now normalised
+                 # to keep the nav branch input scale consistent [0,1].
 
 # ─────────────────────────────────────────────
 # ACTION SPACE
@@ -67,6 +69,11 @@ W_LANE   = 0.3
 W_LIDAR  = 0.3
 W_SPEED  = 0.2
 W_CENTER = 0.2
+W_BLIP   = 0.2   # weight for BLIP semantic safety cosine-similarity bonus
+
+# Terminal / failure reward
+REWARD_TERMINAL = -10.0   # applied on collision, lane exit, LiDAR failure
+REWARD_FAIL     = -3.0    # applied on unexpected Python/CARLA exception
 
 # LiDAR reward thresholds (metres)
 LIDAR_DMID         = 8.0
@@ -85,14 +92,17 @@ CENTER_MAX_DIST = 80.0    # pixels
 CENTER_K        = 2.5
 LANE_RESET_DIST = 85.0    # pixels → episode termination
 
+# Lane centre — real-world scale used by reward.py
+# Corresponds to roughly half a CARLA driving lane width.
+MAX_DISTANCE_FROM_CENTER = 3.0   # metres
+
 # Speed
 TARGET_SPEED = 20.0   # km/h
 MAX_SPEED    = 35.0
 MIN_SPEED    = 15.0
 
-# Reward clipping
+# Reward clipping (legacy; reward.py uses REWARD_TERMINAL directly)
 REWARD_CLIP = 1.0
-REWARD_FAIL = -3.0
 
 # LiDAR episode termination counters
 LIDAR_BELOW_THRESH_COUNT = 10
@@ -101,10 +111,11 @@ LIDAR_WINDOW_STEPS       = 20
 # ─────────────────────────────────────────────
 # TRAINING PARAMETERS
 # ─────────────────────────────────────────────
-TRAIN_TIMESTEPS     = 100_000
-EPISODE_LENGTH      = 75000
-TEST_EPISODES       = 30
-NO_OF_TEST_EPISODES = 10
+TRAIN_TIMESTEPS      = 100_000
+EPISODE_LENGTH       = 75000
+TEST_EPISODES        = 30
+NO_OF_TEST_EPISODES  = 10
+CHECKPOINT_SAVE_FREQ = 10_000   # save a checkpoint every N environment steps
 
 # ─────────────────────────────────────────────
 # SIMULATION / CARLA
