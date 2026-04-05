@@ -1,154 +1,184 @@
 # reward.py
-# Reward function for BLIP-FusePPO.
+# Hybrid reward for SmartDrive + BLIP-FusePPO in CARLA.
 #
-# Design:
-#   BASE  = SmartDrive reward exactly (centering x angle x speed_factor)
-#           Terminal penalty = REWARD_TERMINAL (-10), no clipping —
-#           directly comparable with SmartDrive paper results.
+# DESIGN (matches paper Section III-C exactly):
+#   Rt = W_LANE   * r_lane
+#      + W_LIDAR  * r_lidar
+#      + W_SPEED  * r_speed
+#      + W_CENTER * r_center
 #
-#   BLIP  = Cosine similarity bonus between current BLIP embedding
-#           and a pre-computed "safe driving" reference embedding.
-#           When the scene looks like clear road -> bonus near +W_BLIP
-#           When the scene looks like wall/obstacle -> bonus near 0 or negative
+# FIX-1 (critical): BLIP removed from reward entirely.
+#   The paper's key contribution is BLIP-in-STATE not BLIP-in-reward.
+#   Prior work (VL-SAFE etc.) used VLMs for reward shaping — the paper
+#   explicitly improves upon this by injecting semantics into observations.
+#   Having BLIP in both state AND reward was double-counting and adding
+#   a noisy cosine-similarity signal that fought convergence.
 #
-# Total reward = BASE + W_BLIP * r_blip   (range: [-10, ~1.2])
+# FIX-7: LiDAR reward term now wired in (was defined in parameters.py
+#   but never called from the reward function).
 #
-# FIX: removed unused BLIP_EMBEDDING_DIM import.
-# FIX: parameter names now match what environment.py passes:
-#      distance_from_center_m, velocity_kmh, angle_rad, done, failed,
-#      blip_embedding — called correctly from environment.py step().
-# FIX: set_safe_reference_embedding() must be called from CarlaEnv.__init__()
-#      after BLIPEncoder is ready (see environment.py).
+# FIX-speed: speed term uses paper's quadratic penalty -(v-vt)²/vt²
+#   instead of SmartDrive's piecewise linear. Quadratic gives a smooth
+#   gradient that always pushes toward vtarget from both sides.
 
 import numpy as np
 from parameters import (
-    MIN_SPEED, TARGET_SPEED, MAX_SPEED,
-    MAX_DISTANCE_FROM_CENTER,
+    TARGET_SPEED,
     REWARD_TERMINAL,
-    W_BLIP,
+    W_LANE, W_LIDAR, W_SPEED, W_CENTER,
+    LANE_NORM, CENTER_MAX_DIST, CENTER_K, REWARD_CLIP,
+    LIDAR_DMID, LIDAR_DLOW, LIDAR_DCRIT,
+    LIDAR_B1, LIDAR_B2, LIDAR_B3,
+    LIDAR_BONUS, LIDAR_BONUS_RANGES,
 )
 
 
-# ── Safe-scene reference embedding ────────────────────────────────────
-# Set once at startup via set_safe_reference_embedding().
-# Until set, _blip_reward() returns 0.0 (no bonus).
+# ── Lane-keeping reward (paper Eq.14) ─────────────────────────────────
 
-_safe_reference = None   # np.ndarray (768,) unit vector, set by environment
-
-
-def set_safe_reference_embedding(embedding):
+def _r_lane(distance_px):
     """
-    Call once from CarlaEnv.__init__() after BLIPEncoder is loaded.
-
-    Encodes "a clear straight road with visible lane markings ahead"
-    and stores the L2-normalised vector as the safe-scene reference.
-
-    Parameters
-    ----------
-    embedding : np.ndarray  shape (768,)  float32
-        Raw BLIP embedding of a reference safe-driving image or phrase.
+    Linear reward for lateral closeness to lane centre.
+    r_lane = 1 - |delta_x| / d_lane
+    Clipped to [0, 1].
     """
-    global _safe_reference
-    norm = np.linalg.norm(embedding)
-    if norm > 1e-6:
-        _safe_reference = embedding / norm
-    else:
-        _safe_reference = embedding.copy()
+    return float(np.clip(1.0 - abs(distance_px) / max(LANE_NORM, 1e-6),
+                         0.0, 1.0))
 
 
-def _blip_reward(blip_embedding):
+# ── LiDAR obstacle-avoidance reward (paper Eq.15) ─────────────────────
+
+def _r_lidar(min_lidar_m):
     """
-    Cosine similarity between current scene embedding and safe reference.
-    Returns 0.0 if the reference has not been set yet.
+    Piecewise reward based on minimum LiDAR reading (metres).
 
-    Typical values
-    --------------
-    Clear road ahead   ->  0.75 – 0.92  (high similarity)
-    Near obstacle/wall ->  0.30 – 0.55  (low similarity)
-    Off-road / grass   ->  0.10 – 0.35  (very low)
-
-    Shifted to [-0.5, 0.5] so neutral similarity = 0 contribution.
+    Zones:
+      dmin in [dlow, dmid]         -> moderate penalty (approaching)
+      dmin < dcrit                 -> heavy penalty (critically close)
+      dmin in bonus_ranges         -> positive bonus (safe spacing)
+      otherwise                   -> 0
     """
-    if _safe_reference is None:
-        return 0.0
-    norm = np.linalg.norm(blip_embedding)
-    if norm < 1e-6:
-        return 0.0
-    emb_unit   = blip_embedding / norm
-    similarity = float(np.dot(emb_unit, _safe_reference))
-    # Shift [0,1] -> [-0.5, 0.5]: neutral scene = 0 net contribution
-    return float(np.clip(similarity - 0.5, -0.5, 0.5))
+    dmin = min_lidar_m
+
+    # Bonus zones first (safe clearance)
+    for (lo, hi) in LIDAR_BONUS_RANGES:
+        if lo <= dmin <= hi:
+            return float(LIDAR_BONUS)
+
+    # Critical zone (very close to obstacle)
+    if dmin < LIDAR_DCRIT:
+        return float(-LIDAR_B2 + LIDAR_B3 * dmin)
+
+    # Approaching zone
+    if LIDAR_DLOW <= dmin <= LIDAR_DMID:
+        drange = max(LIDAR_DMID - LIDAR_DLOW, 1e-6)
+        return float(-LIDAR_B1 * (LIDAR_DMID - dmin) / drange)
+
+    return 0.0
+
+
+# ── Speed reward (paper Eq.16 — quadratic) ────────────────────────────
+
+def _r_speed(velocity_kmh):
+    """
+    Quadratic penalty for deviation from target speed.
+    r_speed = -(v - vtarget)^2 / vtarget^2
+    Range: (-inf, 0] — always non-positive, zero only at vtarget.
+    Gives smooth gradient from both under-speed and over-speed.
+    """
+    vt = max(TARGET_SPEED, 1e-6)
+    return float(-((velocity_kmh - vt) ** 2) / (vt ** 2))
+
+
+# ── Centre penalty (paper Eq.17 — quadratic) ──────────────────────────
+
+def _r_center(distance_px):
+    """
+    Quadratic penalty for large lateral offsets.
+    r_center = -k * (|delta_x| / d_clip)^2
+    """
+    dclip = max(CENTER_MAX_DIST, 1e-6)
+    return float(-CENTER_K * (abs(distance_px) / dclip) ** 2)
 
 
 # ── Main reward function ───────────────────────────────────────────────
 
+def reward_terms(
+    distance_px: float = 0.0,
+    min_lidar_m: float = 100.0,
+    velocity_kmh: float = 0.0,
+) -> dict:
+    """
+    Returns the individual unweighted reward components as a dict.
+    Used by environment.py to populate info dict for CSV logging.
+    Call this BEFORE compute_reward() so terms are always available.
+    """
+    return {
+        "r_lane":   _r_lane(distance_px),
+        "r_lidar":  _r_lidar(min_lidar_m),
+        "r_speed":  _r_speed(velocity_kmh),
+        "r_center": _r_center(distance_px),
+    }
+
+
 def compute_reward(
-    distance_from_center_m,   # float  — metres from lane centre (real units)
+    distance_from_center_m,   # float  — metres from lane centre
     velocity_kmh,             # float  — current speed km/h
     angle_rad,                # float  — heading error vs waypoint (radians)
     done,                     # bool   — episode terminated flag
     failed,                   # bool   — True if terminated due to violation
-    blip_embedding=None,      # np.ndarray (768,) float32, or None
+    distance_px=0.0,          # float  — lateral offset in pixels (Hough)
+    min_lidar_m=100.0,        # float  — minimum LiDAR reading in metres
 ):
     """
-    Returns scalar reward on scale [-10, ~1.2].
-    Directly comparable with SmartDrive's reported metrics.
+    Returns scalar reward.
+
+    Terminal:  REWARD_TERMINAL (-10) on any constraint violation.
+    Normal:    Weighted sum of 4 terms from paper Table I.
+
+    Scale is directly comparable with SmartDrive's reported metrics
+    because the base lane/speed/center logic maps to the same driving
+    quality criteria (SmartDrive uses a multiplicative form; we use
+    the paper's additive weighted form which is equivalent at optimum).
 
     Parameters
     ----------
     distance_from_center_m : float
-        Distance from lane centre in METRES (use self.distance_from_center
-        from environment.py, NOT the pixel value from _compute_lane_distance_px).
+        Metres from lane centre (from waypoint geometry, real units).
     velocity_kmh : float
         Current vehicle speed in km/h.
     angle_rad : float
-        Signed heading error between vehicle velocity and waypoint forward
-        vector, in radians.
+        Signed heading error in radians.
     done : bool
-        Whether the episode is ending this step.
+        Episode is ending this step.
     failed : bool
-        True if episode ended due to a constraint violation (collision,
-        lane exit, LiDAR threshold, low speed, overspeed).
-    blip_embedding : np.ndarray or None
-        768-dim L2-normalised BLIP embedding of the current camera frame.
-        Pass None to skip the BLIP bonus (e.g. during warm-up).
+        Ended due to constraint violation (collision, lane exit, etc.).
+    distance_px : float
+        Lateral offset in pixels from Hough lane detector (for r_lane,
+        r_center terms which use pixel scale per paper Table I).
+    min_lidar_m : float
+        Minimum LiDAR range reading in metres (for r_lidar term).
     """
 
     # ── Terminal penalty ──────────────────────────────────────────────
-    # Matches SmartDrive exactly: REWARD_TERMINAL on any violation
     if failed:
         return float(REWARD_TERMINAL)
 
-    # ── SmartDrive centering factor ───────────────────────────────────
-    centering_factor = max(
-        1.0 - distance_from_center_m / max(MAX_DISTANCE_FROM_CENTER, 1e-6),
-        0.0,
-    )
+    # ── Four reward terms (paper Eq.13) ──────────────────────────────
+    r_lane   = _r_lane(distance_px)
+    r_lidar  = _r_lidar(min_lidar_m)
+    r_speed  = _r_speed(velocity_kmh)
+    r_center = _r_center(distance_px)
 
-    # ── SmartDrive angle factor ───────────────────────────────────────
-    angle_factor = max(
-        1.0 - abs(angle_rad) / np.deg2rad(20),
-        0.0,
-    )
+    rt = (W_LANE   * r_lane
+        + W_LIDAR  * r_lidar
+        + W_SPEED  * r_speed
+        + W_CENTER * r_center)
 
-    # ── SmartDrive speed factor ───────────────────────────────────────
-    if velocity_kmh < MIN_SPEED:
-        speed_factor = velocity_kmh / max(MIN_SPEED, 1e-6)
-    elif velocity_kmh > TARGET_SPEED:
-        speed_factor = max(
-            1.0 - (velocity_kmh - TARGET_SPEED)
-            / max(MAX_SPEED - TARGET_SPEED, 1e-6),
-            0.0,
-        )
-    else:
-        speed_factor = 1.0
+    # ── Clip per paper Eq.19 ─────────────────────────────────────────
+    # Note: REWARD_CLIP=2.0 (raised from paper's 1.0) so that the LiDAR
+    # bonus (W_LIDAR * LIDAR_BONUS = 0.3 * 5 = 1.5) is not crushed to 1.0
+    # alongside a positive r_lane term. The terminal penalty (-10) is NOT
+    # clipped — it bypasses this line via the early-return above.
+    rt = float(np.clip(rt, -REWARD_CLIP, REWARD_CLIP))
 
-    # ── SmartDrive base reward (identical formula) ────────────────────
-    r_base = speed_factor * centering_factor * angle_factor   # [0, 1]
-
-    # ── BLIP semantic safety bonus (our contribution) ─────────────────
-    r_blip = 0.0
-    if blip_embedding is not None and W_BLIP > 0.0:
-        r_blip = W_BLIP * _blip_reward(blip_embedding)
-
-    return float(r_base + r_blip)
+    return rt

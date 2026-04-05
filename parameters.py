@@ -1,27 +1,19 @@
 # parameters.py
-# Combined BLIP-FusePPO + SmartDrive parameters
-# PPO: Stable Baselines3 (PyTorch)
-# Environment: CARLA (SmartDrive structure)
+# SmartDrive + BLIP-FusePPO hybrid — CARLA + SB3 PPO
 #
-# FIX-A: LANE_RESET_DIST raised 85 → 120 px.
-#        The Hough detector is noisy; 85 px was terminating valid episodes.
-#        SmartDrive's equivalent metric threshold is 3.0 m (~120 px at this scale).
-#
-# FIX-B: LIDAR termination window doubled (20 → 40 steps, same count=10).
-#        This changes the trigger from 50% → 25% of window, matching
-#        SmartDrive's more forgiving early-training behaviour.
-#
-# FIX-C: ACTION_STD_DECAY_FREQ 300 → 75 episodes.
-#        SmartDrive's 4 decay steps over 1200 episodes = every 300 ep.
-#        Our budget is ~400 episodes (100k steps), so 4 decays = every 75 ep.
-#
-# FIX-D: W_BLIP disabled for first 200 episodes via BLIP_WARMUP_EPISODES.
-#        The safe reference is a proxy image, not a real road frame.
-#        Adding cosine-similarity noise in early training hurts convergence.
-#
-# FIX-E: checkpoint_frequency initial value 100 → 50.
-#        Saves checkpoints more often so the agent recovers to a closer
-#        restart point, exactly matching SmartDrive's checkpoint-reset strategy.
+# CHANGES vs previous version:
+#   FIX-1: W_BLIP removed from reward. BLIP is state-only per paper design.
+#           The paper's core claim: inject BLIP into state, not reward.
+#   FIX-2: N_STEPS 2048 → 512. More frequent policy updates (~2 eps/update
+#           vs ~8 eps/update). Matches SmartDrive's per-episode update cadence.
+#   FIX-3: ENT_COEF 0.0 → 0.01. Non-zero entropy keeps exploration alive
+#           alongside sigma decay callback. Critical for policy not collapsing.
+#   FIX-4: BLIP_WARMUP_EPISODES 200 → 50. With ~400-episode budget, 200ep
+#           warmup wastes half of training with uninformative BLIP embeddings.
+#   FIX-5: ExplorationDecay callback episode counter now synced from env.
+#           (handled in exploration_callback.py)
+#   FIX-6: Augmented reward recomputed (handled in environment.py).
+#   FIX-7: LiDAR reward term wired into compute_reward() (reward.py).
 
 # ─────────────────────────────────────────────
 # CAMERA / IMAGE
@@ -33,14 +25,15 @@ IM_HEIGHT = 80
 # BLIP ENCODER
 # ─────────────────────────────────────────────
 BLIP_MODEL_NAME      = "Salesforce/blip-image-captioning-large"
-BLIP_EMBEDDING_DIM   = 768        # BERT-based text encoder output
-BLIP_UPDATE_INTERVAL = 10         # regenerate every K steps, cache otherwise
+BLIP_EMBEDDING_DIM   = 768
+BLIP_UPDATE_INTERVAL = 10        # regenerate every K steps, cache otherwise
 BLIP_MAX_LENGTH      = 50
 BLIP_CACHE_SIZE      = 100
 
-# FIX-D: disable BLIP reward bonus for this many episodes at the start.
-# Set to 0 to enable from the beginning (once you have a real reference frame).
-BLIP_WARMUP_EPISODES = 200
+# FIX-4: reduced from 200 → 50.
+# With ~400 total episodes, 50ep warmup lets the agent learn with a
+# meaningful BLIP state for 350 episodes instead of only 200.
+BLIP_WARMUP_EPISODES = 50
 
 # ─────────────────────────────────────────────
 # OBSERVATION SPACE KEYS & DIMS
@@ -64,102 +57,108 @@ ACTION_DIM = 2   # [steering, throttle]
 # SB3 PPO HYPERPARAMETERS
 # ─────────────────────────────────────────────
 LEARNING_RATE = 3e-4
-N_STEPS       = 2048
+# FIX-2: 2048 → 512. Policy updates every ~2 episodes instead of ~8.
+N_STEPS       = 512
 BATCH_SIZE    = 64
 N_EPOCHS      = 10
 GAMMA         = 0.99
 GAE_LAMBDA    = 0.95
 CLIP_RANGE    = 0.2
-ENT_COEF      = 0.0
+# FIX-3: 0.0 → 0.01. Prevents policy collapsing to deterministic too early.
+ENT_COEF      = 0.01
 VF_COEF       = 0.5
 MAX_GRAD_NORM = 0.5
 SEED          = 42
 
-# FIX-C: decay every 75 episodes so 4 full decay steps fit in ~400-episode run
+# Variable exploration noise (SmartDrive strategy)
 ACTION_STD_INIT       = 0.4
 ACTION_STD_MIN        = 0.05
 ACTION_STD_DECAY      = 0.05
-ACTION_STD_DECAY_FREQ = 75        # was 300 — now 4 decays over 300-episode run
+# 4 decay steps across ~400-episode run: every 75 episodes
+ACTION_STD_DECAY_FREQ = 75
 
 # ─────────────────────────────────────────────
-# REWARD WEIGHTS
+# REWARD WEIGHTS  (paper Table I)
 # ─────────────────────────────────────────────
 W_LANE   = 0.3
 W_LIDAR  = 0.3
 W_SPEED  = 0.2
 W_CENTER = 0.2
-W_BLIP   = 0.2   # active only after BLIP_WARMUP_EPISODES (FIX-D)
+# FIX-1: W_BLIP REMOVED. BLIP goes into state only, not reward.
+# The paper (Section I-B) explicitly contrasts their approach (BLIP in state)
+# with prior work that uses VLMs for reward shaping. Using both is wrong.
 
-REWARD_TERMINAL = -10.0
-REWARD_FAIL     = -3.0
+REWARD_TERMINAL = -10.0   # SmartDrive terminal penalty — unchanged
+REWARD_FAIL     = -3.0    # soft fail (env exception)
 
-# LiDAR reward thresholds (metres)
-LIDAR_DMID         = 8.0
-LIDAR_DLOW         = 4.0
-LIDAR_DCRIT        = 2.8
-LIDAR_DFAIL        = 2.0
-LIDAR_B1           = 5.0
-LIDAR_B2           = 10.0
-LIDAR_B3           = 2.0
-LIDAR_BONUS        = 5.0
-LIDAR_BONUS_RANGES = [(3.0, 4.0), (8.0, 10.0)]
+# ─────────────────────────────────────────────
+# REWARD: LIDAR TERMS  (paper Eq.15 / Table I)
+# ─────────────────────────────────────────────
+LIDAR_DMID         = 8.0          # m — mid-distance threshold
+LIDAR_DLOW         = 4.0          # m — low-distance threshold
+LIDAR_DCRIT        = 2.8          # m — critical penalty starts
+LIDAR_DFAIL        = 2.0          # m — termination threshold
+LIDAR_B1           = 5.0          # penalty coefficient (dmid zone)
+LIDAR_B2           = 10.0         # penalty offset (dcrit zone)
+LIDAR_B3           = 2.0          # penalty slope (dcrit zone)
+LIDAR_BONUS        = 5.0          # bonus magnitude in safe ranges
+LIDAR_BONUS_RANGES = [(3.0, 4.0), (8.0, 10.0)]   # m — safe spacing bonus
 
-# Lane / center thresholds
-LANE_NORM       = 100.0   # pixels
-CENTER_MAX_DIST = 80.0    # pixels
-CENTER_K        = 2.5
+# ─────────────────────────────────────────────
+# REWARD: LANE / CENTER TERMS  (paper Table I)
+# ─────────────────────────────────────────────
+LANE_NORM       = 100.0   # pixels — normalisation constant dlane
+CENTER_MAX_DIST = 80.0    # pixels — saturation threshold dclip
+CENTER_K        = 2.5     # gain k for centre penalty
+REWARD_CLIP     = 2.0     # raised from paper's 1.0: W_LIDAR*LIDAR_BONUS=1.5 > 1.0 gets clipped otherwise
 
-# FIX-A: raised from 85 → 120 px.
-# Hough detector noise was causing valid episodes to terminate.
-# 120 px ≈ 3.0 m, matching SmartDrive's max_distance_from_center.
-LANE_RESET_DIST = 120.0   # pixels — was 85
+# Lane termination — pixel threshold (Hough detector)
+# Raised from 85 → 120 px to match SmartDrive's 3.0 m threshold.
+LANE_RESET_DIST = 120.0   # pixels
 
-# Lane centre — real-world scale used by reward.py
-MAX_DISTANCE_FROM_CENTER = 3.0   # metres
+# Lane centre in real-world metres (SmartDrive metric)
+MAX_DISTANCE_FROM_CENTER = 3.5   # metres — slightly relaxed from 3.0
+                                  # The spawn waypoint geometry can start
+                                  # the first step at ~3m; 3.5 gives one
+                                  # step of grace before terminating.
 
-# Speed
+# ─────────────────────────────────────────────
+# SPEED
+# ─────────────────────────────────────────────
 TARGET_SPEED = 20.0   # km/h
 MAX_SPEED    = 35.0
-MIN_SPEED    = 15.0
+MIN_SPEED    = 5.0    # lowered from 15.0 — car needs time to accelerate from spawn
+                      # 15 km/h was terminating episodes before the agent could learn
+                      # to move. Raise back to 10-15 once agent consistently moves.
 
-REWARD_CLIP = 1.0
-
-# FIX-B: window doubled (20→40), count unchanged (10).
-# Trigger threshold: 10/40 = 25% instead of 10/20 = 50%.
-# Prevents over-eager termination when agent brushes obstacles in early training.
+# ─────────────────────────────────────────────
+# LIDAR TERMINATION WINDOW
+# ─────────────────────────────────────────────
+# Window doubled (20→40), count unchanged (10).
+# Trigger = 10/40 = 25% instead of 50% — matches SmartDrive's
+# more forgiving early-training termination behaviour.
 LIDAR_BELOW_THRESH_COUNT = 10
-LIDAR_WINDOW_STEPS       = 40    # was 20
+LIDAR_WINDOW_STEPS       = 40
 
 # ─────────────────────────────────────────────
-# TRAINING PARAMETERS
+# CARLA / ENVIRONMENT
 # ─────────────────────────────────────────────
-TRAIN_TIMESTEPS      = 100_000
-EPISODE_LENGTH       = 75000
-TEST_EPISODES        = 30
-NO_OF_TEST_EPISODES  = 10
-CHECKPOINT_SAVE_FREQ = 10_000
+TOWN                 = "Town02"
+CAR_NAME             = "vehicle.lincoln.mkz_2017"
+NUMBER_OF_PEDESTRIAN = 0
+VISUAL_DISPLAY       = True
+EPISODE_LENGTH       = 10000      # max steps per episode
 
 # ─────────────────────────────────────────────
-# SIMULATION / CARLA
+# TRAINING / PATHS
 # ─────────────────────────────────────────────
-TOWN                 = 'Town02'
-CAR_NAME             = 'model3'
-NUMBER_OF_VEHICLES   = 30
-NUMBER_OF_PEDESTRIAN = 10
-CONTINUOUS_ACTION    = True
-VISUAL_DISPLAY       = False
+TRAIN_TIMESTEPS    = 200_000
+TEST_EPISODES      = 100
+CHECKPOINT_LOAD    = False
+CHECKPOINT_SAVE_FREQ = 10_000    # SB3 CheckpointCallback frequency (steps)
 
-# ─────────────────────────────────────────────
-# PATHS
-# ─────────────────────────────────────────────
-RESULTS_PATH    = 'Results_BLIP'
-PPO_MODEL_PATH  = f'{RESULTS_PATH}/ppo_model'
-CHECKPOINT_PATH = f'{RESULTS_PATH}/checkpoints'
-LOG_PATH_TRAIN  = f'{RESULTS_PATH}/runs/train'
-LOG_PATH_TEST   = f'{RESULTS_PATH}/runs/test'
-TEST_IMAGES     = f'{RESULTS_PATH}/test_images'
-
-# ─────────────────────────────────────────────
-# MISC
-# ─────────────────────────────────────────────
-CHECKPOINT_LOAD = False
+PPO_MODEL_PATH  = "Results_BLIP/model/blip_fuseppo"
+LOG_PATH_TRAIN  = "Results_BLIP/logs/train"
+LOG_PATH_TEST   = "Results_BLIP/logs/test"
+CHECKPOINT_PATH = "Results_BLIP/checkpoints"
+RESULTS_PATH    = "Results_BLIP"

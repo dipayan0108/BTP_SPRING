@@ -1,20 +1,31 @@
 # csv_logging_callback.py
-# Writes one CSV row per training episode with comprehensive reward metrics.
+# One CSV row per training episode — lean and diagnostic.
 #
-# Reward metrics tracked:
-#   episode_reward     — absolute total reward for the episode (SUM)
-#   mean_reward_10ep   — rolling mean over last 10 episodes
-#   mean_reward_50ep   — rolling mean over last 50 episodes
-#   mean_reward_100ep  — rolling mean over last 100 episodes
-#   best_reward_ever   — highest single episode reward seen so far
-#   reward_std_10ep    — std deviation over last 10 eps (consistency)
-#   reward_per_step    — episode_reward / episode_length (quality per step)
-#   cumulative_reward  — running total reward across all episodes
+# COLUMN DECISIONS:
+#   KEPT:    episode, timestep, wall_time_s          — position in training
+#   KEPT:    episode_reward, mean_reward_10ep        — core convergence signal
+#   KEPT:    reward_std_10ep                         — policy stability
+#   KEPT:    reward_per_step                         — quality per step (normalises ep length)
+#   KEPT:    episode_length, distance_covered_m      — driving performance
+#   KEPT:    lane_deviation_m                        — matches SmartDrive metric
+#   KEPT:    sigma_noise                             — tracks exploration decay progress
+#   KEPT:    done_reason                             — diagnose why episodes end
+#   KEPT:    r_lane, r_lidar, r_speed, r_center      — reward term breakdown for debugging
+#
+#   CUT:     mean_reward_50ep, mean_reward_100ep     — computable from episode_reward column
+#   CUT:     cumulative_reward                       — computable as cumsum(episode_reward)
+#   CUT:     best_reward_ever                        — computable as cummax(episode_reward)
+#   These 4 were bloat — any analysis tool (pandas, Excel) computes them in one line.
+#
+#   TENSORBOARD already logs: episode_reward, distance_covered, lane_deviation,
+#   mean_reward_10ep via RewardLoggingCallback — CSV is the persistent offline record.
 
 import csv
+import math
 import os
 import time
 import numpy as np
+import torch
 from stable_baselines3.common.callbacks import BaseCallback
 
 from parameters import LOG_PATH_TRAIN
@@ -22,30 +33,37 @@ from parameters import LOG_PATH_TRAIN
 CSV_FILENAME = "training_log.csv"
 
 CSV_COLUMNS = [
+    # ── Position ──────────────────────────────────────────────────────
     "episode",
     "timestep",
     "wall_time_s",
-    # Reward metrics
+    # ── Core reward ───────────────────────────────────────────────────
     "episode_reward",
     "mean_reward_10ep",
-    "mean_reward_50ep",
-    "mean_reward_100ep",
-    "best_reward_ever",
     "reward_std_10ep",
     "reward_per_step",
-    "cumulative_reward",
-    # Episode metrics
+    # ── Driving performance ───────────────────────────────────────────
     "episode_length",
     "distance_covered_m",
     "lane_deviation_m",
-
+    "done_reason",           # collision | lane_exit | destination | timeout
+    # ── Exploration ───────────────────────────────────────────────────
+    "sigma_noise",           # current policy std — confirms decay is working
+    # ── Reward term breakdown ─────────────────────────────────────────
+    # Lets you see which term dominates / is miscalibrated per episode.
+    "r_lane_mean",
+    "r_lidar_mean",
+    "r_speed_mean",
+    "r_center_mean",
 ]
 
 
 class CSVLoggingCallback(BaseCallback):
     """
     Writes one CSV row per training episode.
-    Tracks both absolute and averaged reward metrics.
+
+    Reward term breakdown requires the environment to expose per-step
+    reward components via info dict. If not present, columns default to 0.
     """
 
     def __init__(self, log_dir: str = LOG_PATH_TRAIN, verbose: int = 0):
@@ -59,8 +77,13 @@ class CSVLoggingCallback(BaseCallback):
         self._episode_length    = 0
         self._training_start    = None
         self._reward_history    = []
-        self._best_reward       = float('-inf')
-        self._cumulative_reward = 0.0
+
+        # Per-episode reward term accumulators
+        self._r_lane_sum   = 0.0
+        self._r_lidar_sum  = 0.0
+        self._r_speed_sum  = 0.0
+        self._r_center_sum = 0.0
+        self._r_steps      = 0
 
     def _on_training_start(self) -> None:
         os.makedirs(self._log_dir, exist_ok=True)
@@ -81,6 +104,16 @@ class CSVLoggingCallback(BaseCallback):
             self._file   = None
             self._writer = None
 
+    def _get_sigma(self) -> float:
+        """Read current policy std from log_std parameter."""
+        try:
+            policy = self.model.policy
+            if hasattr(policy, 'log_std'):
+                return float(torch.exp(policy.log_std).mean().item())
+        except Exception:
+            pass
+        return 0.0
+
     def _on_step(self) -> bool:
         rewards = self.locals.get("rewards", [0.0])
         dones   = self.locals.get("dones",   [False])
@@ -90,35 +123,50 @@ class CSVLoggingCallback(BaseCallback):
             self._episode_reward += float(reward)
             self._episode_length += 1
 
-            if done:
-                self._episode          += 1
-                ep_r                    = self._episode_reward
-                self._cumulative_reward += ep_r
-                self._reward_history.append(ep_r)
-                self._best_reward = max(self._best_reward, ep_r)
+            # Accumulate individual reward terms if environment exposes them
+            self._r_lane_sum   += float(info.get("r_lane",   0.0))
+            self._r_lidar_sum  += float(info.get("r_lidar",  0.0))
+            self._r_speed_sum  += float(info.get("r_speed",  0.0))
+            self._r_center_sum += float(info.get("r_center", 0.0))
+            self._r_steps      += 1
 
-                hist     = self._reward_history
-                mean_10  = float(np.mean(hist[-10:]))
-                mean_50  = float(np.mean(hist[-50:]))
-                mean_100 = float(np.mean(hist[-100:]))
-                std_10   = float(np.std(hist[-10:])) if len(hist) >= 2 else 0.0
-                rps      = ep_r / self._episode_length if self._episode_length > 0 else 0.0
+            if done:
+                self._episode += 1
+                ep_r = self._episode_reward
+                self._reward_history.append(ep_r)
+
+                hist    = self._reward_history
+                mean_10 = float(np.mean(hist[-10:]))
+                std_10  = float(np.std(hist[-10:])) if len(hist) >= 2 else 0.0
+                rps     = ep_r / self._episode_length if self._episode_length > 0 else 0.0
+
+                # Reward term means (0 if env doesn't expose them)
+                n = max(self._r_steps, 1)
+                r_lane_mean   = round(self._r_lane_sum   / n, 5)
+                r_lidar_mean  = round(self._r_lidar_sum  / n, 5)
+                r_speed_mean  = round(self._r_speed_sum  / n, 5)
+                r_center_mean = round(self._r_center_sum / n, 5)
+
+                # done_reason: environment sets this in info if available
+                done_reason = info.get("done_reason", "unknown")
 
                 row = {
-                    "episode":           self._episode,
-                    "timestep":          self.num_timesteps,
-                    "wall_time_s":       round(time.time() - self._training_start, 2),
-                    "episode_reward":    round(ep_r, 4),
-                    "mean_reward_10ep":  round(mean_10, 4),
-                    "mean_reward_50ep":  round(mean_50, 4),
-                    "mean_reward_100ep": round(mean_100, 4),
-                    "best_reward_ever":  round(self._best_reward, 4),
-                    "reward_std_10ep":   round(std_10, 4),
-                    "reward_per_step":   round(rps, 6),
-                    "cumulative_reward": round(self._cumulative_reward, 4),
-                    "episode_length":    self._episode_length,
-                    "distance_covered_m": info.get("distance_covered", 0),
-                    "lane_deviation_m":  round(info.get("center_lane_deviation", 0), 6),
+                    "episode":          self._episode,
+                    "timestep":         self.num_timesteps,
+                    "wall_time_s":      round(time.time() - self._training_start, 1),
+                    "episode_reward":   round(ep_r, 4),
+                    "mean_reward_10ep": round(mean_10, 4),
+                    "reward_std_10ep":  round(std_10, 4),
+                    "reward_per_step":  round(rps, 6),
+                    "episode_length":   self._episode_length,
+                    "distance_covered_m": round(float(info.get("distance_covered", 0)), 1),
+                    "lane_deviation_m": round(float(info.get("center_lane_deviation", 0)), 6),
+                    "done_reason":      done_reason,
+                    "sigma_noise":      round(self._get_sigma(), 5),
+                    "r_lane_mean":      r_lane_mean,
+                    "r_lidar_mean":     r_lidar_mean,
+                    "r_speed_mean":     r_speed_mean,
+                    "r_center_mean":    r_center_mean,
                 }
 
                 self._writer.writerow(row)
@@ -127,15 +175,21 @@ class CSVLoggingCallback(BaseCallback):
                 if self.verbose > 0:
                     print(
                         f"[CSVLogger] Ep {self._episode:4d} | "
-                        f"R={ep_r:7.2f} | "
-                        f"avg10={mean_10:7.2f} | "
-                        f"avg100={mean_100:7.2f} | "
-                        f"best={self._best_reward:7.2f} | "
+                        f"R={ep_r:7.3f} | "
+                        f"avg10={mean_10:7.3f} | "
                         f"std={std_10:.3f} | "
-                        f"R/step={rps:.4f}"
+                        f"dist={info.get('distance_covered',0):5.0f}m | "
+                        f"reason={done_reason} | "
+                        f"σ={self._get_sigma():.3f}"
                     )
 
+                # Reset episode accumulators
                 self._episode_reward = 0.0
                 self._episode_length = 0
+                self._r_lane_sum     = 0.0
+                self._r_lidar_sum    = 0.0
+                self._r_speed_sum    = 0.0
+                self._r_center_sum   = 0.0
+                self._r_steps        = 0
 
         return True

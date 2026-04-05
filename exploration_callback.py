@@ -1,12 +1,17 @@
 # exploration_callback.py
-# Variable exploration noise decay — FIX-C applied.
+# Variable exploration noise decay — SmartDrive strategy adapted for SB3.
 #
-# SmartDrive decays sigma every 300 episodes across 1200 total = 4 decay steps.
-# Our training budget is ~400 episodes (100k steps at current episode lengths).
-# ACTION_STD_DECAY_FREQ is now 75 in parameters.py, giving 4 decay steps
-# across our run: 0.40 → 0.35 → 0.30 → 0.25 → 0.20, reaching ~0.20 at ep 300.
+# FIX-5: Episode counter now synced from env info dict instead of an
+#   internal counter that reset to 0 on checkpoint resume.
+#   Previously: self._episode_count started at 0 every run, so sigma
+#   always started at ACTION_STD_INIT=0.4 even when loading from ep 200.
+#   Now: reads episode_count from info dict that environment provides,
+#   which persists across checkpoint loads via env._episode_count.
 #
-# The requires_grad fix from the original version is preserved.
+# Decay schedule:
+#   SmartDrive: 4 decays over 1200 episodes = every 300 ep.
+#   Our budget: ~400 episodes (200k steps), so every 75 episodes = 4 decays.
+#   0.40 → 0.35 → 0.30 → 0.25 → 0.20 (floored at ACTION_STD_MIN=0.05)
 
 import math
 import torch
@@ -17,58 +22,63 @@ from parameters import (
     ACTION_STD_MIN,
     ACTION_STD_DECAY,
     ACTION_STD_DECAY_FREQ,
-    BLIP_WARMUP_EPISODES,
 )
 
 
 class ExplorationDecayCallback(BaseCallback):
     """
     Decays policy action std every ACTION_STD_DECAY_FREQ episodes.
-    Also logs BLIP warmup status to the console.
+    Episode count is read from env info dict to survive checkpoint resumes.
     """
 
     def __init__(self, verbose=1):
         super().__init__(verbose)
-        self._current_std   = ACTION_STD_INIT
-        self._episode_count = 0
+        self._current_std    = ACTION_STD_INIT
+        # Track the last episode count seen, to detect new episodes
+        self._last_ep_count  = 0
+        # Track how many decay steps we've applied
+        self._decays_applied = 0
 
     def _on_training_start(self):
         self._set_action_std(self._current_std)
         if self.verbose > 0:
-            print(f"[ExplorationDecay] Initial sigma_noise = {self._current_std}")
-            print(f"[ExplorationDecay] BLIP bonus active after episode {BLIP_WARMUP_EPISODES}")
-            print(f"[ExplorationDecay] Decay schedule: every {ACTION_STD_DECAY_FREQ} episodes")
+            print(f"[ExplorationDecay] Initial sigma_noise = {self._current_std:.4f}")
+            print(f"[ExplorationDecay] Decay: -{ACTION_STD_DECAY} every "
+                  f"{ACTION_STD_DECAY_FREQ} episodes")
 
     def _on_step(self):
         dones = self.locals.get("dones", [])
         infos = self.locals.get("infos", [{}])
 
         for done, info in zip(dones, infos):
-            if done:
-                self._episode_count += 1
+            if not done:
+                continue
 
-                # Log BLIP activation milestone
-                ep_count = info.get("episode_count", self._episode_count)
-                if ep_count == BLIP_WARMUP_EPISODES and self.verbose > 0:
-                    print(f"\n[ExplorationDecay] BLIP reward bonus NOW ACTIVE (ep {ep_count})\n")
+            # FIX-5: read episode count from env info (survives resume)
+            ep_count = info.get("episode_count", self._last_ep_count)
+            self._last_ep_count = ep_count
 
-                if (self._episode_count % ACTION_STD_DECAY_FREQ == 0
-                        and self._episode_count > 0):
-                    self._current_std = max(
-                        self._current_std - ACTION_STD_DECAY,
-                        ACTION_STD_MIN,
+            # Compute how many decays should have been applied by now
+            decays_due = ep_count // ACTION_STD_DECAY_FREQ
+            while self._decays_applied < decays_due:
+                new_std = max(
+                    self._current_std - ACTION_STD_DECAY,
+                    ACTION_STD_MIN,
+                )
+                self._current_std   = new_std
+                self._decays_applied += 1
+                self._set_action_std(new_std)
+
+                if self.verbose > 0:
+                    print(
+                        f"\n[ExplorationDecay] Episode {ep_count}: "
+                        f"sigma_noise -> {new_std:.4f}\n"
                     )
-                    self._set_action_std(self._current_std)
 
-                    if self.verbose > 0:
-                        print(
-                            f"\n[ExplorationDecay] "
-                            f"Episode {self._episode_count}: "
-                            f"sigma_noise -> {self._current_std:.4f}\n"
-                        )
         return True
 
     def _set_action_std(self, std):
+        """Set log_std on SB3 policy so it takes effect on next rollout."""
         policy = self.model.policy
         if not hasattr(policy, 'log_std'):
             return

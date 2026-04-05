@@ -1,30 +1,28 @@
 # environment.py
-# CARLA Gym environment — BLIP-FusePPO + SmartDrive structure.
+# CARLA Gym environment — SmartDrive + BLIP-FusePPO hybrid.
 #
-# FIXES applied in this version (see FIX-A through FIX-E tags):
+# KEY FIXES in this version:
 #
-#   FIX-A (checkpoint reset):
-#       checkpoint_waypoint_index is now updated at every episode end,
-#       identical to SmartDrive's logic. Agent resets to last saved
-#       checkpoint instead of always starting at waypoint 0.
-#       Initial checkpoint_frequency = 50 (was 100) for more frequent saves.
+#   FIX-1 (reward signature):
+#       compute_reward() now receives distance_px and min_lidar_m.
+#       Previously the LiDAR and pixel-lane terms in parameters.py were
+#       never passed in, so only the terminal penalty fired correctly.
 #
-#   FIX-B (real safe reference):
-#       _init_safe_reference() now waits for the first real CARLA camera
-#       frame after reset() rather than using a grey placeholder image.
-#       Called once after the first reset, not in __init__.
+#   FIX-6 (augmented reward):
+#       The augmented transition now recomputes reward with the flipped
+#       observation instead of cloning the real reward. Previously every
+#       real transition was counted twice in the value function, inflating
+#       V(s) estimates and destabilising training.
+#       BLIP is already regenerated for the flipped image in _build_aug_obs()
+#       — that part was correct and is preserved.
 #
-#   FIX-C (BLIP warmup):
-#       BLIP reward bonus is suppressed for the first BLIP_WARMUP_EPISODES
-#       episodes. A noisy reference embedding hurts early-training gradients.
-#       After warmup, W_BLIP is applied normally.
+#   FIX-BLIP-warmup:
+#       BLIP state embedding is always included in obs (state role).
+#       The warmup gate is removed — it was suppressing the BLIP bonus in
+#       the reward, which no longer exists (FIX-1 in reward.py).
+#       BLIP embeddings are meaningful from episode 1 (real CARLA frames).
 #
-#   FIX-D (metric-only lane termination):
-#       Lane exit now checked via self.distance_from_center (metres) against
-#       MAX_DISTANCE_FROM_CENTER (3.0 m) in addition to the pixel threshold.
-#       The pixel threshold LANE_RESET_DIST was raised to 120 in parameters.py.
-#
-#   Previously documented fixes (FIX-1 through FIX-6) are unchanged.
+#   Previously documented fixes (FIX-A through FIX-E) are preserved.
 
 import os
 import sys
@@ -52,7 +50,7 @@ import carla
 from sensors      import (CameraSensor, CameraSensorEnv,
                            CollisionSensor, LiDARSensor, PIDController)
 from blip_encoder import BLIPEncoder
-from reward       import compute_reward, set_safe_reference_embedding
+from reward       import compute_reward, reward_terms
 from parameters   import (
     IM_HEIGHT, IM_WIDTH,
     LIDAR_DIM, PID_DIM, NAV_DIM,
@@ -60,11 +58,12 @@ from parameters   import (
     OBS_KEY_IMAGE, OBS_KEY_BLIP, OBS_KEY_LIDAR, OBS_KEY_PID, OBS_KEY_NAV,
     TOWN, CAR_NAME, NUMBER_OF_PEDESTRIAN, VISUAL_DISPLAY,
     MAX_SPEED, MIN_SPEED, TARGET_SPEED,
-    BLIP_UPDATE_INTERVAL, BLIP_WARMUP_EPISODES,
+    BLIP_UPDATE_INTERVAL,
     LANE_RESET_DIST, LIDAR_DFAIL,
     LIDAR_BELOW_THRESH_COUNT, LIDAR_WINDOW_STEPS,
     MAX_DISTANCE_FROM_CENTER,
-    REWARD_FAIL, EPISODE_LENGTH,
+    REWARD_FAIL, REWARD_TERMINAL, EPISODE_LENGTH,
+    LANE_NORM,
 )
 
 
@@ -105,8 +104,6 @@ class CarlaEnv(gym.Env):
     metadata = {"render.modes": ["human"]}
 
     def __init__(self, client, world, checkpoint_frequency=50):
-        # FIX-A: initial checkpoint_frequency=50 (was 100) — saves checkpoints
-        # every 50 m so the agent resumes closer to where it failed.
         super().__init__()
 
         self.client    = client
@@ -130,8 +127,7 @@ class CarlaEnv(gym.Env):
             OBS_KEY_NAV: spaces.Box(
                 -5.0, 5.0, (NAV_DIM,), dtype=np.float32),
         })
-        self.action_space = spaces.Box(
-            -1.0, 1.0, (2,), dtype=np.float32)
+        self.action_space = spaces.Box(-1.0, 1.0, (2,), dtype=np.float32)
 
         # ── Sensor handles ───────────────────────────────────────────
         self.camera_obj     = None
@@ -142,25 +138,20 @@ class CarlaEnv(gym.Env):
         self.actor_list     = []
         self.walker_list    = []
 
-        # ── State helpers ────────────────────────────────────────────
+        # ── Helpers ──────────────────────────────────────────────────
         self.blip_encoder = BLIPEncoder()
         self.pid          = PIDController()
 
-        # FIX-B: safe reference is NOT built here from a fake image.
-        # It will be set after the first real CARLA frame in reset().
-        self._safe_reference_set = False
-
-        # FIX-C: track episode count for BLIP warmup
-        self._episode_count = 0
-
-        # BLIP caching
+        # ── State ────────────────────────────────────────────────────
+        self._episode_count  = 0
         self._frame_counter  = 0
         self._last_blip_emb  = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
         self._last_aug_blip  = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
         self._last_image_rgb = None
         self._last_pid_val   = 0.0
+        self._last_distance_px = 0.0
+        self._last_min_lidar_m = 100.0
 
-        # Episode tracking
         self.vehicle                   = None
         self.route_waypoints           = []
         self.current_waypoint_index    = 0
@@ -176,13 +167,10 @@ class CarlaEnv(gym.Env):
         self.center_lane_deviation     = 0.0
         self.distance_covered          = 0.0
         self.episode_start_time        = time.time()
-        self._last_distance_px         = 0.0
 
-        # LiDAR termination counters
         self._lidar_below_count  = 0
         self._lidar_window_steps = 0
 
-        # Augmentation phase flag
         self._aug_phase           = 0
         self._last_aug_transition = None
 
@@ -201,6 +189,8 @@ class CarlaEnv(gym.Env):
             self._lidar_window_steps = 0
             self._aug_phase          = 0
             self._last_pid_val       = 0.0
+            self._last_distance_px   = 0.0
+            self._last_min_lidar_m   = 100.0
 
             self._last_blip_emb  = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
             self._last_aug_blip  = np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32)
@@ -209,29 +199,47 @@ class CarlaEnv(gym.Env):
             # ── Spawn vehicle ─────────────────────────────────────────
             vehicle_bp = self._get_vehicle_bp(CAR_NAME)
             if self.town == 'Town02':
-                transform = self.map.get_spawn_points()[30]
                 self.total_distance = 500
+                spawn_idx = 30
             elif self.town == 'Town07':
-                transform = self.map.get_spawn_points()[20]
                 self.total_distance = 750
+                spawn_idx = 20
             else:
-                transform = self.map.get_spawn_points()[12]
                 self.total_distance = 500
+                spawn_idx = 12
 
-            self.vehicle = self.world.try_spawn_actor(vehicle_bp, transform)
+            # Get the fixed spawn point transform
+            spawn_transform = self.map.get_spawn_points()[spawn_idx]
+
+            # Project it onto the nearest driving waypoint so the car
+            # starts exactly on the lane centre facing the road direction.
+            # This eliminates wall collisions from awkward spawn angles.
+            spawn_wp = self.map.get_waypoint(
+                spawn_transform.location,
+                project_to_road=True,
+                lane_type=carla.LaneType.Driving,
+            )
+            spawn_tf = spawn_wp.transform
+            spawn_tf.location.z = spawn_transform.location.z + 0.3
+
+            self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_tf)
             if self.vehicle is None:
-                for sp in self.map.get_spawn_points():
-                    self.vehicle = self.world.try_spawn_actor(vehicle_bp, sp)
-                    if self.vehicle is not None:
-                        break
+                # Fallback: use raw spawn point
+                spawn_transform.location.z += 0.3
+                self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_transform)
+                spawn_wp = self.map.get_waypoint(
+                    spawn_transform.location,
+                    project_to_road=True,
+                    lane_type=carla.LaneType.Driving,
+                )
             if self.vehicle is None:
-                raise RuntimeError("Failed to spawn vehicle at any spawn point")
+                raise RuntimeError("Failed to spawn vehicle")
             self.actor_list.append(self.vehicle)
 
             # ── Attach sensors ────────────────────────────────────────
             self.camera_obj = CameraSensor(self.vehicle)
             while len(self.camera_obj.front_camera) == 0:
-                time.sleep(0.0001)
+                time.sleep(0.001)
             self.sensor_list.append(self.camera_obj.sensor)
 
             if self.display_on:
@@ -245,7 +253,7 @@ class CarlaEnv(gym.Env):
             self.lidar_obj = LiDARSensor(self.vehicle)
             self.sensor_list.append(self.lidar_obj.sensor)
 
-            # ── Vehicle state ─────────────────────────────────────────
+            # ── Episode state ─────────────────────────────────────────
             self.timesteps             = 0
             self.throttle              = 0.0
             self.previous_steer        = 0.0
@@ -254,43 +262,56 @@ class CarlaEnv(gym.Env):
             self.angle                 = 0.0
             self.center_lane_deviation = 0.0
             self.distance_covered      = 0.0
-            self.episode_start_time    = time.time()
-            self._last_distance_px     = 0.0
+            # episode_start_time set after throttle impulse below
 
-            # ── Waypoints ─────────────────────────────────────────────
+            # ── Route waypoints ───────────────────────────────────────
             if self.fresh_start:
                 self.current_waypoint_index = 0
                 self.route_waypoints = []
-                wp = self.map.get_waypoint(
-                    self.vehicle.get_location(),
-                    project_to_road=True,
-                    lane_type=carla.LaneType.Driving,
-                )
+                # FIX-WAYPOINT: start route from the actual spawn waypoint,
+                # not from get_waypoint(vehicle.get_location()) which can
+                # project to the wrong lane and cause immediate lane_exit.
+                wp = spawn_wp
                 self.route_waypoints.append(wp)
                 for x in range(self.total_distance):
+                    nexts = wp.next(1.0)
+                    if not nexts:
+                        break
                     if self.town == 'Town02':
-                        nxt = wp.next(1.0)[-1] if x > 100 else wp.next(1.0)[0]
+                        nxt = nexts[-1] if x > 100 else nexts[0]
                     elif self.town == 'Town07':
-                        nxt = wp.next(1.0)[-1] if x < 650 else wp.next(1.0)[0]
+                        nxt = nexts[-1] if x < 650 else nexts[0]
                     else:
-                        nxt = wp.next(1.0)[-1] if x < 300 else wp.next(1.0)[0]
+                        nxt = nexts[-1] if x < 300 else nexts[0]
                     self.route_waypoints.append(nxt)
                     wp = nxt
             else:
-                # FIX-A: teleport to last checkpoint, not waypoint 0
                 wp = self.route_waypoints[
                     self.checkpoint_waypoint_index % len(self.route_waypoints)]
                 self.vehicle.set_transform(wp.transform)
                 self.current_waypoint_index = self.checkpoint_waypoint_index
 
-            time.sleep(0.5)
+            # Wait for physics to settle before starting episode.
+            time.sleep(1.0)
+
+            # FIX-SPEED: Apply initial throttle impulse so the car is
+            # already moving at the start of step 1. Without this, the
+            # car sits at v=0 and r_speed stays very negative for the
+            # first ~20 steps while the agent slowly learns to throttle.
+            # 0.7 throttle for 0.8s gets the car to ~10-15 km/h at step 1.
+            self.vehicle.apply_control(carla.VehicleControl(
+                throttle=0.7, steer=0.0, brake=0.0))
+            time.sleep(0.8)
+
+            # Clear collision history AFTER settling — any spawn bumps
+            # from the physics engine initialising are discarded.
             self.collision_history.clear()
+            # Reset episode start time AFTER impulse so 30s grace period
+            # is measured from when the agent actually takes control.
+            self.episode_start_time = time.time()
 
-            # FIX-B: build safe reference from first real CARLA frame
-            if not self._safe_reference_set:
-                self._init_safe_reference_from_real_frame()
-
-            return self._build_obs()
+            obs = self._build_obs()
+            return obs
 
         except Exception as e:
             print(f"[Env.reset] error: {e}")
@@ -298,33 +319,12 @@ class CarlaEnv(gym.Env):
             return self._blank_obs()
 
     # ------------------------------------------------------------------ #
-    #  Safe-reference from real frame  (FIX-B)                           #
-    # ------------------------------------------------------------------ #
-
-    def _init_safe_reference_from_real_frame(self):
-        """
-        Captures a real CARLA semantic-segmentation frame and uses it as
-        the BLIP safe-scene reference. Called once after the first reset().
-        A real road frame produces a meaningful cosine-similarity baseline.
-        """
-        try:
-            while len(self.camera_obj.front_camera) == 0:
-                time.sleep(0.001)
-            real_frame = self.camera_obj.front_camera[-1].copy()
-            ref_emb = self.blip_encoder.get_embedding(real_frame)
-            set_safe_reference_embedding(ref_emb)
-            self._safe_reference_set = True
-            print("[CarlaEnv] Safe-scene reference set from real CARLA frame.")
-        except Exception as e:
-            print(f"[CarlaEnv] Warning: could not init safe reference: {e}")
-
-    # ------------------------------------------------------------------ #
     #  Step                                                               #
     # ------------------------------------------------------------------ #
 
     def step(self, action):
         try:
-            # ── Augmented phase ───────────────────────────────────────
+            # ── Augmented phase — return pre-built transition ─────────
             if self._aug_phase == 1:
                 self._aug_phase = 0
                 return self._last_aug_transition
@@ -336,9 +336,17 @@ class CarlaEnv(gym.Env):
 
             steer    = float(np.clip(action[0], -1.0, 1.0))
             throttle = float(np.clip((action[1] + 1.0) / 2.0, 0.0, 1.0))
+
+            # FIX-SMOOTH: Removed 0.9/0.1 action smoothing.
+            # With smoothing, throttle after 1 step = 0.1 * action only.
+            # After 10 steps with action=1.0, throttle only reaches 0.65.
+            # This means the car barely accelerates, r_speed stays very
+            # negative, and the agent never learns that throttle = speed.
+            # SmartDrive used smoothing but had a 1200-episode budget.
+            # With 400 episodes we need direct, responsive control.
             self.vehicle.apply_control(carla.VehicleControl(
-                steer    = self.previous_steer * 0.9 + steer    * 0.1,
-                throttle = self.throttle       * 0.9 + throttle * 0.1,
+                steer    = steer,
+                throttle = throttle,
             ))
             self.previous_steer = steer
             self.throttle       = throttle
@@ -358,20 +366,25 @@ class CarlaEnv(gym.Env):
             if not self.route_waypoints:
                 raise RuntimeError("route_waypoints not initialised")
             wi = self.current_waypoint_index
-            for _ in range(len(self.route_waypoints)):
+            # FIX-TRACK: cap loop at 50, not len(route_waypoints).
+            # Previous loop over full 500-waypoint list had an exit
+            # condition that meant only 1-2 waypoints advanced per step.
+            # At 20 km/h with 1m spacing, car can pass up to ~5-10
+            # waypoints per step. 50 gives a safe ceiling.
+            for _ in range(50):
                 nwi = wi + 1
-                wp  = self.route_waypoints[nwi % len(self.route_waypoints)]
-                dot = np.dot(
-                    self._vec(wp.transform.get_forward_vector())[:2],
-                    self._vec(location - wp.transform.location)[:2],
-                )
-                if dot > 0.0:
+                if nwi >= len(self.route_waypoints):
+                    break
+                wp     = self.route_waypoints[nwi]
+                wp_fwd = self._vec(wp.transform.get_forward_vector())[:2]
+                to_veh = self._vec(location - wp.transform.location)[:2]
+                if np.dot(wp_fwd, to_veh) > 0.0:
                     wi += 1
                 else:
                     break
             self.current_waypoint_index = wi
             cur_wp  = self.route_waypoints[wi % len(self.route_waypoints)]
-            next_wp = self.route_waypoints[(wi + 1) % len(self.route_waypoints)]
+            next_wp = self.route_waypoints[min(wi + 1, len(self.route_waypoints) - 1)]
 
             self.distance_from_center = self._dist_to_line(
                 self._vec(cur_wp.transform.location),
@@ -384,15 +397,17 @@ class CarlaEnv(gym.Env):
             wp_fwd = self._vec(cur_wp.transform.rotation.get_forward_vector())
             self.angle = self._signed_angle_diff(fwd, wp_fwd)
 
-            # ── LiDAR ─────────────────────────────────────────────────
-            lidar_norm  = self.lidar_obj.range_data
-            min_lidar_m = float(np.min(lidar_norm)) * 100.0
+            # ── LiDAR readings ────────────────────────────────────────
+            lidar_norm     = self.lidar_obj.range_data        # (180,) in [0,1]
+            # Sensor normalises to [0,1] over 100 m max range
+            min_lidar_m    = float(np.min(lidar_norm)) * 100.0
+            self._last_min_lidar_m = min_lidar_m
 
-            # ── Lane distance (pixels, termination only) ───────────────
+            # ── Lane pixel distance (Hough, for reward terms) ─────────
             distance_px = self._compute_lane_distance_px()
             self._last_distance_px = distance_px
 
-            # ── LiDAR termination window (FIX-B in parameters) ────────
+            # ── LiDAR termination window ──────────────────────────────
             if min_lidar_m < LIDAR_DFAIL:
                 self._lidar_below_count += 1
             self._lidar_window_steps += 1
@@ -407,17 +422,24 @@ class CarlaEnv(gym.Env):
             done   = False
             failed = False
 
-            if len(self.collision_history) != 0:
+            # FIX-GRACE: Skip all termination checks for first 10 steps.
+            # The spawn + physics settle can produce:
+            #   - transient distance_from_center > 3m before car aligns
+            #   - Hough returning bad distance_px on first frames
+            #   - collision impulse from ground contact
+            # 10 steps at 20km/h = ~1m — negligible route progress lost.
+            early_grace = self.timesteps <= 10
+
+            if not early_grace and len(self.collision_history) != 0:
                 done = failed = True
-            # FIX-D: use metric distance check as primary, pixel as secondary
-            elif self.distance_from_center > MAX_DISTANCE_FROM_CENTER:
+            elif not early_grace and self.distance_from_center > MAX_DISTANCE_FROM_CENTER:
                 done = failed = True
-            elif abs(distance_px) > LANE_RESET_DIST:
+            elif not early_grace and abs(distance_px) > LANE_RESET_DIST:
                 done = failed = True
             elif lidar_done:
                 done = failed = True
-            elif (self.episode_start_time + 10 < time.time()
-                  and self.velocity < 1.0):
+            elif (self.episode_start_time + 30 < time.time()
+                  and self.velocity < MIN_SPEED):
                 done = failed = True
             elif self.velocity > MAX_SPEED:
                 done = failed = True
@@ -433,32 +455,76 @@ class CarlaEnv(gym.Env):
             elif self.timesteps >= 2e6:
                 done = True
 
-            # FIX-A: update checkpoint index on every episode step
-            # (mirrors SmartDrive: checkpoint saved every N metres)
+            # ── Checkpoint update (SmartDrive strategy) ───────────────
             if self.checkpoint_frequency is not None:
                 self.checkpoint_waypoint_index = (
                     self.current_waypoint_index // self.checkpoint_frequency
                 ) * self.checkpoint_frequency
 
-            # FIX-C: suppress BLIP bonus during warmup episodes
-            blip_emb_for_reward = None
-            if self._episode_count >= BLIP_WARMUP_EPISODES:
-                blip_emb_for_reward = self._last_blip_emb
-
+            # ── Reward (FIX-1: pass distance_px + min_lidar_m) ────────
+            # Compute individual terms first (for CSV diagnostic logging)
+            terms = reward_terms(
+                distance_px  = distance_px,
+                min_lidar_m  = min_lidar_m,
+                velocity_kmh = self.velocity,
+            )
             reward = compute_reward(
                 distance_from_center_m = self.distance_from_center,
                 velocity_kmh           = self.velocity,
                 angle_rad              = self.angle,
                 done                   = done,
                 failed                 = failed,
-                blip_embedding         = blip_emb_for_reward,
+                distance_px            = distance_px,
+                min_lidar_m            = min_lidar_m,
             )
 
-            obs     = self._build_obs()
-            aug_obs = self._build_aug_obs()
+            # Determine done_reason for CSV logging
+            if failed:
+                if len(self.collision_history) != 0:
+                    done_reason = "collision"
+                elif self.distance_from_center > MAX_DISTANCE_FROM_CENTER:
+                    done_reason = "lane_exit_metric"
+                elif abs(distance_px) > LANE_RESET_DIST:
+                    done_reason = "lane_exit_px"
+                elif lidar_done:
+                    done_reason = "lidar"
+                else:
+                    done_reason = "other_fail"
+            elif done:
+                if self.current_waypoint_index >= len(self.route_waypoints) - 2:
+                    done_reason = "destination"
+                else:
+                    done_reason = "timeout"
+            else:
+                done_reason = ""
+
+            # ── Build real observation ────────────────────────────────
+            obs = self._build_obs()
+
+            # ── Build augmented transition (FIX-6: recompute reward) ──
+            aug_obs    = self._build_aug_obs()
             aug_action = np.array([-action[0], action[1]], dtype=np.float32)
-            self._last_aug_transition = (aug_obs, reward, done,
-                                         {"augmented_action": aug_action})
+
+            # FIX-6: augmented reward recomputed for FLIPPED observation.
+            # Previously the real reward was cloned — doubling every reward
+            # signal in the value function. Now we recompute properly.
+            # The flipped image has the same distance_from_center and velocity,
+            # but the steering sign is inverted — reflected in aug_action.
+            # distance_px sign is also flipped for the mirrored lane position.
+            aug_reward = compute_reward(
+                distance_from_center_m = self.distance_from_center,
+                velocity_kmh           = self.velocity,
+                angle_rad              = -self.angle,           # mirrored
+                done                   = done,
+                failed                 = failed,
+                distance_px            = -distance_px,          # mirrored
+                min_lidar_m            = min_lidar_m,           # same sensor
+            )
+
+            self._last_aug_transition = (
+                aug_obs, aug_reward, done,
+                {"augmented_action": aug_action},
+            )
             self._aug_phase = 1
 
             if done:
@@ -474,7 +540,12 @@ class CarlaEnv(gym.Env):
                 "distance_covered":      self.distance_covered,
                 "center_lane_deviation": self.center_lane_deviation,
                 "episode_count":         self._episode_count,
-                "blip_active":           self._episode_count >= BLIP_WARMUP_EPISODES,
+                "done_reason":           done_reason,
+                # Per-term reward breakdown for CSV logger
+                "r_lane":                terms["r_lane"],
+                "r_lidar":               terms["r_lidar"],
+                "r_speed":               terms["r_speed"],
+                "r_center":              terms["r_center"],
             }
             return obs, reward, done, info
 
@@ -494,6 +565,7 @@ class CarlaEnv(gym.Env):
         self._last_image_rgb = image_rgb
         image_norm = image_rgb.astype(np.float32) / 255.0
 
+        # BLIP — always included in state (no warmup gate — FIX-BLIP-warmup)
         if self._frame_counter % BLIP_UPDATE_INTERVAL == 0:
             self._last_blip_emb = self.blip_encoder.get_embedding(image_rgb)
         blip_emb = self._last_blip_emb.copy()
@@ -506,17 +578,14 @@ class CarlaEnv(gym.Env):
         normalized_velocity             = self.velocity / max(TARGET_SPEED, 1e-6)
         normalized_distance_from_center = self.distance_from_center / 3.0
         normalized_angle                = abs(self.angle) / np.deg2rad(20)
-        nav_vec = np.array(
-            [
-                self.throttle,
-                normalized_velocity,
-                normalized_distance_from_center,
-                normalized_angle,
-                float(self.current_waypoint_index)
-                / max(float(len(self.route_waypoints)), 1.0),
-            ],
-            dtype=np.float32,
-        )
+        nav_vec = np.array([
+            self.throttle,
+            normalized_velocity,
+            normalized_distance_from_center,
+            normalized_angle,
+            float(self.current_waypoint_index)
+            / max(float(len(self.route_waypoints)), 1.0),
+        ], dtype=np.float32)
 
         return {
             OBS_KEY_IMAGE: image_norm,
@@ -527,12 +596,18 @@ class CarlaEnv(gym.Env):
         }
 
     def _build_aug_obs(self):
+        """
+        Horizontally mirrored observation.
+        Image flipped, LiDAR reversed, PID sign inverted.
+        BLIP regenerated for the flipped image (paper Fig.3 requirement).
+        """
         if self._last_image_rgb is None or self.lidar_obj is None:
             return self._blank_obs()
 
         aug_image_rgb  = cv2.flip(self._last_image_rgb, 1)
         aug_image_norm = aug_image_rgb.astype(np.float32) / 255.0
 
+        # Regenerate BLIP for the flipped image per paper Fig.3
         if self._frame_counter % BLIP_UPDATE_INTERVAL == 0:
             self._last_aug_blip = self.blip_encoder.get_embedding(aug_image_rgb)
         aug_blip_emb = self._last_aug_blip.copy()
@@ -543,17 +618,14 @@ class CarlaEnv(gym.Env):
         normalized_velocity             = self.velocity / max(TARGET_SPEED, 1e-6)
         normalized_distance_from_center = self.distance_from_center / 3.0
         normalized_angle                = abs(self.angle) / np.deg2rad(20)
-        nav_vec = np.array(
-            [
-                self.throttle,
-                normalized_velocity,
-                normalized_distance_from_center,
-                normalized_angle,
-                float(self.current_waypoint_index)
-                / max(float(len(self.route_waypoints)), 1.0),
-            ],
-            dtype=np.float32,
-        )
+        nav_vec = np.array([
+            self.throttle,
+            normalized_velocity,
+            normalized_distance_from_center,
+            normalized_angle,
+            float(self.current_waypoint_index)
+            / max(float(len(self.route_waypoints)), 1.0),
+        ], dtype=np.float32)
 
         return {
             OBS_KEY_IMAGE: aug_image_norm,
@@ -566,140 +638,142 @@ class CarlaEnv(gym.Env):
     def _blank_obs(self):
         return {
             OBS_KEY_IMAGE: np.zeros((IM_HEIGHT, IM_WIDTH, 3), dtype=np.float32),
-            OBS_KEY_BLIP:  np.zeros(BLIP_EMBEDDING_DIM,       dtype=np.float32),
-            OBS_KEY_LIDAR: np.zeros(LIDAR_DIM,                dtype=np.float32),
-            OBS_KEY_PID:   np.zeros(PID_DIM,                  dtype=np.float32),
-            OBS_KEY_NAV:   np.zeros(NAV_DIM,                  dtype=np.float32),
+            OBS_KEY_BLIP:  np.zeros(BLIP_EMBEDDING_DIM, dtype=np.float32),
+            OBS_KEY_LIDAR: np.ones(LIDAR_DIM, dtype=np.float32),
+            OBS_KEY_PID:   np.zeros(PID_DIM, dtype=np.float32),
+            OBS_KEY_NAV:   np.zeros(NAV_DIM, dtype=np.float32),
         }
 
     # ------------------------------------------------------------------ #
-    #  Lane distance (Hough) — termination check only                    #
+    #  Lane detection (pixel distance, for reward only)                   #
     # ------------------------------------------------------------------ #
 
     def _compute_lane_distance_px(self):
-        if (self.camera_obj is None
-                or len(self.camera_obj.front_camera) == 0):
+        """
+        Hough-based lane centre offset in pixels.
+        Returns 0.0 if no lanes detected.
+        """
+        if self._last_image_rgb is None:
             return 0.0
-        img   = self.camera_obj.front_camera[-1]
-        gray  = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        edges = cv2.Canny(gray, 50, 150)
-        lines = cv2.HoughLinesP(edges, 1, np.pi / 60, 15,
-                                minLineLength=5, maxLineGap=100)
-        if lines is None:
-            return 0.0
-        h, w  = img.shape[:2]
-        cx    = w // 2
-        lefts, rights = [], []
-        for l in lines:
-            x1, y1, x2, y2 = l[0]
-            slope = (y2 - y1) / (x2 - x1 + 1e-6)
-            if slope < -0.2:
-                lefts.append((x1 + x2) // 2)
-            elif slope > 0.2:
-                rights.append((x1 + x2) // 2)
-        lx  = int(np.mean(lefts))  if lefts  else 0
-        rx  = int(np.mean(rights)) if rights else w
-        mid = (lx + rx) // 2
-        return float(mid - cx)
-
-    # ------------------------------------------------------------------ #
-    #  Pedestrians                                                        #
-    # ------------------------------------------------------------------ #
-
-    def _create_pedestrians(self):
         try:
-            spawn_pts = []
-            for _ in range(NUMBER_OF_PEDESTRIAN):
-                sp  = carla.Transform()
-                loc = self.world.get_random_location_from_navigation()
-                if loc:
-                    sp.location = loc
-                    spawn_pts.append(sp)
-            for sp in spawn_pts:
-                w_bp    = random.choice(self.bp_lib.filter('walker.pedestrian.*'))
-                ctrl_bp = self.bp_lib.find('controller.ai.walker')
-                if w_bp.has_attribute('is_invincible'):
-                    w_bp.set_attribute('is_invincible', 'false')
-                if w_bp.has_attribute('speed'):
-                    w_bp.set_attribute(
-                        'speed',
-                        w_bp.get_attribute('speed').recommended_values[1])
-                walker = self.world.try_spawn_actor(w_bp, sp)
-                if walker:
-                    ctrl = self.world.spawn_actor(
-                        ctrl_bp, carla.Transform(), walker)
-                    self.walker_list += [ctrl.id, walker.id]
-            actors = self.world.get_actors(self.walker_list)
-            for i in range(0, len(self.walker_list), 2):
-                actors[i].start()
-                actors[i].go_to_location(
-                    self.world.get_random_location_from_navigation())
+            gray = cv2.cvtColor(self._last_image_rgb, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            h, w  = edges.shape
+            roi   = edges[h // 2:, :]
+            lines = cv2.HoughLinesP(roi, 1, np.pi / 180,
+                                    threshold=30,
+                                    minLineLength=20,
+                                    maxLineGap=10)
+            if lines is None:
+                return 0.0
+            xs = [(x1 + x2) / 2.0 for line in lines for x1, _, x2, _ in [line[0]]]
+            if not xs:
+                return 0.0
+            lane_center = np.mean(xs)
+            image_center = w / 2.0
+            return float(lane_center - image_center)
         except Exception:
-            self.client.apply_batch(
-                [carla.command.DestroyActor(x) for x in self.walker_list])
+            return 0.0
 
     # ------------------------------------------------------------------ #
-    #  Helpers                                                            #
+    #  Geometry helpers                                                   #
     # ------------------------------------------------------------------ #
-
-    def _get_vehicle_bp(self, car_name):
-        bp = self.bp_lib.filter(car_name)[0]
-        if bp.has_attribute('color'):
-            bp.set_attribute('color', random.choice(
-                bp.get_attribute('color').recommended_values))
-        return bp
 
     @staticmethod
     def _vec(v):
         if hasattr(v, 'x'):
-            return np.array([v.x, v.y, v.z])
-        return np.array(v)
+            return np.array([v.x, v.y, v.z], dtype=np.float64)
+        return np.array(v, dtype=np.float64)
 
     @staticmethod
     def _dist_to_line(a, b, p):
-        ab = b - a
-        ap = p - a
-        t  = np.dot(ap, ab) / (np.dot(ab, ab) + 1e-6)
-        return float(np.linalg.norm(p - (a + t * ab)))
+        ab  = b - a
+        ab_len = np.linalg.norm(ab[:2])
+        if ab_len < 1e-6:
+            return float(np.linalg.norm((p - a)[:2]))
+        cross = abs(ab[0] * (a[1] - p[1]) - (a[0] - p[0]) * ab[1])
+        return float(cross / ab_len)
 
     @staticmethod
-    def _signed_angle_diff(v1, v2):
-        n1 = np.linalg.norm(v1[:2])
-        n2 = np.linalg.norm(v2[:2])
-        if n1 < 1e-6 or n2 < 1e-6:
+    def _signed_angle_diff(fwd, wp_fwd):
+        fwd_norm    = np.linalg.norm(fwd[:2])
+        wp_fwd_norm = np.linalg.norm(wp_fwd[:2])
+        if fwd_norm < 1e-6 or wp_fwd_norm < 1e-6:
             return 0.0
-        u1 = v1[:2] / n1
-        u2 = v2[:2] / n2
-        cos_a = float(np.clip(np.dot(u1, u2), -1.0, 1.0))
-        angle = math.acos(cos_a)
-        cross = u1[0] * u2[1] - u1[1] * u2[0]
-        return angle if cross >= 0 else -angle
+        cos_a = np.clip(np.dot(fwd[:2], wp_fwd[:2]) / (fwd_norm * wp_fwd_norm),
+                        -1.0, 1.0)
+        cross = fwd[0] * wp_fwd[1] - fwd[1] * wp_fwd[0]
+        return float(math.copysign(math.acos(cos_a), cross))
+
+    # ------------------------------------------------------------------ #
+    #  Actor management                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _get_vehicle_bp(self, name):
+        bp = list(self.bp_lib.filter(name))
+        if not bp:
+            bp = list(self.bp_lib.filter('vehicle.*'))
+        # Always take index 0 — random.choice was picking a different
+        # car variant each episode, changing vehicle dynamics mid-training.
+        return bp[0]
 
     def _destroy_actors(self):
-        for obj in (self.camera_obj,
-                    self.env_camera_obj,
-                    self.collision_obj,
-                    self.lidar_obj):
-            if obj is not None:
-                try:
-                    obj.destroy()
-                except Exception as e:
-                    print(f"[Env] Warning: sensor destroy failed: {e}")
+        for sensor in self.sensor_list:
+            try:
+                if sensor and sensor.is_alive:
+                    sensor.stop()
+                    sensor.destroy()
+            except Exception:
+                pass
+        self.sensor_list.clear()
+
+        for actor in self.actor_list:
+            try:
+                if actor and actor.is_alive:
+                    actor.destroy()
+            except Exception:
+                pass
+        self.actor_list.clear()
 
         self.camera_obj     = None
         self.env_camera_obj = None
         self.collision_obj  = None
         self.lidar_obj      = None
 
-        if self.actor_list:
+    def _create_pedestrians(self):
+        try:
+            for _ in range(NUMBER_OF_PEDESTRIAN):
+                sp = carla.Transform()
+                loc = self.world.get_random_location_from_navigation()
+                if loc is None:
+                    continue
+                sp.location = loc
+                walker_bp = random.choice(
+                    self.bp_lib.filter('walker.pedestrian.*'))
+                ctrl_bp = self.bp_lib.find('controller.ai.walker')
+                if walker_bp.has_attribute('is_invincible'):
+                    walker_bp.set_attribute('is_invincible', 'false')
+                if walker_bp.has_attribute('speed'):
+                    walker_bp.set_attribute(
+                        'speed',
+                        walker_bp.get_attribute('speed').recommended_values[1])
+                walker = self.world.try_spawn_actor(walker_bp, sp)
+                if walker is None:
+                    continue
+                ctrl = self.world.spawn_actor(ctrl_bp, carla.Transform(), walker)
+                self.walker_list.extend([ctrl.id, walker.id])
+            actors = self.world.get_actors(self.walker_list)
+            for i in range(0, len(actors), 2):
+                actors[i].start()
+                actors[i].go_to_location(
+                    self.world.get_random_location_from_navigation())
+        except Exception:
             self.client.apply_batch(
-                [carla.command.DestroyActor(x) for x in self.actor_list])
-            self.actor_list.clear()
-
-        self.sensor_list.clear()
-
-    def render(self, mode='human'):
-        pass
+                [carla.command.DestroyActor(x) for x in self.walker_list])
+            self.walker_list.clear()
 
     def close(self):
         self._destroy_actors()
+        self.client.apply_batch(
+            [carla.command.DestroyActor(x) for x in self.walker_list])
+        self.walker_list.clear()
