@@ -316,6 +316,15 @@ class CarlaEnv(gym.Env):
         except Exception as e:
             print(f"[Env.reset] error: {e}")
             self._destroy_actors()
+            # Spawn failure often means CARLA world is in bad state.
+            # Reconnect and retry once before giving up.
+            if "Failed to spawn" in str(e) or self.vehicle is None:
+                print("[Env.reset] Attempting CARLA reconnect...")
+                if self._reconnect_carla():
+                    try:
+                        return self.reset()   # one retry after reconnect
+                    except Exception as e2:
+                        print(f"[Env.reset] retry failed: {e2}")
             return self._blank_obs()
 
     # ------------------------------------------------------------------ #
@@ -455,18 +464,27 @@ class CarlaEnv(gym.Env):
             elif self.timesteps >= 2e6:
                 done = True
 
+            # ── Accumulate real distance in metres ────────────────────
+            # FIX-DIST: was |current_waypoint_index - checkpoint_waypoint_index|
+            # which (a) reset when checkpoint_frequency became None and
+            # (b) only counted waypoints passed, not actual metres driven.
+            # Now: sum velocity * dt each step = true odometer reading.
+            # CARLA physics runs at 20Hz by default → dt = 1/20 = 0.05s
+            self.distance_covered += (self.velocity / 3.6) * 0.05
+
             # ── Checkpoint update (SmartDrive strategy) ───────────────
             if self.checkpoint_frequency is not None:
                 self.checkpoint_waypoint_index = (
                     self.current_waypoint_index // self.checkpoint_frequency
                 ) * self.checkpoint_frequency
 
-            # ── Reward (FIX-1: pass distance_px + min_lidar_m) ────────
-            # Compute individual terms first (for CSV diagnostic logging)
+            # ── Reward ────────────────────────────────────────────────
             terms = reward_terms(
-                distance_px  = distance_px,
-                min_lidar_m  = min_lidar_m,
-                velocity_kmh = self.velocity,
+                distance_from_center_m = self.distance_from_center,
+                velocity_kmh           = self.velocity,
+                angle_rad              = self.angle,
+                min_lidar_m            = min_lidar_m,
+                distance_px            = distance_px,
             )
             reward = compute_reward(
                 distance_from_center_m = self.distance_from_center,
@@ -530,9 +548,7 @@ class CarlaEnv(gym.Env):
             if done:
                 self._episode_count += 1
                 self.center_lane_deviation /= max(self.timesteps, 1)
-                self.distance_covered = abs(
-                    self.current_waypoint_index
-                    - self.checkpoint_waypoint_index)
+                # distance_covered already accumulated per-step above
                 self._destroy_actors()
                 self._aug_phase = 0
 
@@ -542,6 +558,7 @@ class CarlaEnv(gym.Env):
                 "episode_count":         self._episode_count,
                 "done_reason":           done_reason,
                 # Per-term reward breakdown for CSV logger
+                "r_base":                terms.get("r_base",   0.0),
                 "r_lane":                terms["r_lane"],
                 "r_lidar":               terms["r_lidar"],
                 "r_speed":               terms["r_speed"],
@@ -552,6 +569,9 @@ class CarlaEnv(gym.Env):
         except Exception as e:
             print(f"[Env.step] error: {e}")
             self._destroy_actors()
+            # If vehicle is None, CARLA actor was lost — need world reconnect
+            if self.vehicle is None:
+                self._reconnect_carla()
             return self._blank_obs(), REWARD_FAIL, True, {}
 
     # ------------------------------------------------------------------ #
@@ -771,6 +791,30 @@ class CarlaEnv(gym.Env):
             self.client.apply_batch(
                 [carla.command.DestroyActor(x) for x in self.walker_list])
             self.walker_list.clear()
+
+    def _reconnect_carla(self) -> bool:
+        """
+        Reload the CARLA world after a vehicle actor loss or spawn failure.
+        Called automatically when self.vehicle is None after an exception.
+        Returns True if reconnect succeeded, False otherwise.
+        """
+        print("[Env] Reconnecting to CARLA...")
+        for attempt in range(5):
+            try:
+                time.sleep(3.0 * (attempt + 1))   # back-off: 3s, 6s, 9s...
+                self._destroy_actors()
+                # Reload world to clear any stuck actors
+                self.world  = self.client.load_world(TOWN)
+                self.world.set_weather(carla.WeatherParameters.CloudyNoon)
+                self.bp_lib = self.world.get_blueprint_library()
+                self.map    = self.world.get_map()
+                self.fresh_start = True
+                print(f"[Env] CARLA reconnect succeeded (attempt {attempt+1})")
+                return True
+            except Exception as e:
+                print(f"[Env] Reconnect attempt {attempt+1} failed: {e}")
+        print("[Env] All reconnect attempts failed — world may be unrecoverable")
+        return False
 
     def close(self):
         self._destroy_actors()

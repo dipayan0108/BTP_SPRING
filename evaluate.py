@@ -74,10 +74,14 @@ def compute_metrics(records):
 
     distances = np.array([r["distance_covered_m"] for r in records])
     rewards   = np.array([r["total_reward"]        for r in records])
+    rps       = np.array([r["reward_per_step"]      for r in records])
+    steps_arr = np.array([r["steps"]                for r in records])
     reasons   = [r["done_reason"]                  for r in records]
 
-    mean_dist       = float(np.mean(distances))
-    mean_reward     = float(np.mean(rewards))
+    mean_dist           = float(np.mean(distances))
+    mean_reward         = float(np.mean(rewards))
+    mean_reward_per_step= float(np.mean(rps))
+    mean_steps          = float(np.mean(steps_arr))
     completion_rate = float(sum(1 for r in reasons if r == "destination") / n)
     collision_rate  = float(sum(1 for r in reasons if r == "collision")   / n)
     lane_exit_rate  = float(sum(1 for r in reasons if r == "lane_exit")   / n)
@@ -99,18 +103,20 @@ def compute_metrics(records):
     mean_inf = float(np.mean(inf_times)) if inf_times else 0.0
 
     return {
-        "rmse_m":           rmse,
-        "std_dev_m":        std_dev,
-        "nrmse":            nrmse,
-        "mean_distance_m":  mean_dist,
-        "mean_reward":      mean_reward,
-        "completion_rate":  completion_rate,
-        "collision_rate":   collision_rate,
-        "lane_exit_rate":   lane_exit_rate,
-        "mean_speed_kmh":   mean_speed,
-        "speed_stability":  speed_stability,
-        "steering_jerk":    steering_jerk,
-        "mean_inference_ms": mean_inf,
+        "rmse_m":               rmse,
+        "std_dev_m":            std_dev,
+        "nrmse":                nrmse,
+        "mean_distance_m":      mean_dist,
+        "mean_reward":          mean_reward,
+        "mean_reward_per_step": mean_reward_per_step,
+        "mean_steps":           mean_steps,
+        "completion_rate":      completion_rate,
+        "collision_rate":       collision_rate,
+        "lane_exit_rate":       lane_exit_rate,
+        "mean_speed_kmh":       mean_speed,
+        "speed_stability":      speed_stability,
+        "steering_jerk":        steering_jerk,
+        "mean_inference_ms":    mean_inf,
     }
 
 
@@ -134,6 +140,7 @@ def run_evaluation():
         obs       = env.reset()
         done      = False
         ep_reward = 0.0
+        ep_steps  = 0
         devs_m    = []
         speeds    = []
         steers    = []
@@ -148,6 +155,7 @@ def run_evaluation():
 
             obs, reward, done, info = env.step(action)
             ep_reward += reward
+            ep_steps  += 1
 
             dev_px = env._last_distance_px
             devs_m.append(abs(dev_px) * SCALE_PX_TO_M)
@@ -155,26 +163,19 @@ def run_evaluation():
             steers.append(float(action[0]))
 
             if done:
-                # FIX-eval: use LANE_RESET_DIST from parameters (120 px)
-                col_data = (
-                    env.collision_obj.collision_data
-                    if env.collision_obj is not None else []
-                )
-                if len(col_data) > 0:
-                    done_reason = "collision"
-                elif abs(env._last_distance_px) > LANE_RESET_DIST:
-                    done_reason = "lane_exit"
-                elif env.current_waypoint_index >= len(
-                        env.route_waypoints or []) - 2:
-                    done_reason = "destination"
+                # Use done_reason from info dict — single source of truth
+                done_reason = info.get("done_reason", "timeout")
                 break
 
-        dist_m = info.get("distance_covered", 0) * 1.0
+        dist_m          = info.get("distance_covered", 0.0)
+        reward_per_step = ep_reward / max(ep_steps, 1)
 
         records.append({
             "lateral_deviations_m": devs_m,
             "distance_covered_m":   float(dist_m),
             "total_reward":         ep_reward,
+            "reward_per_step":      reward_per_step,
+            "steps":                ep_steps,
             "speeds_kmh":           speeds,
             "steers":               steers,
             "done_reason":          done_reason,
@@ -222,6 +223,8 @@ def run_evaluation():
              SMARTDRIVE_GPU["mean_reward"],
              SMARTDRIVE_EDGE["mean_reward"],
              "N/A", "N/A", "N/A"),
+            ("reward_per_step",  metrics["mean_reward_per_step"],
+             0.7727, "N/A", "N/A", "N/A", "N/A"),
             ("mean_speed_kmh",   metrics["mean_speed_kmh"],
              SMARTDRIVE_GPU["mean_speed_kmh"],
              SMARTDRIVE_EDGE["mean_speed_kmh"],
@@ -272,6 +275,10 @@ def run_evaluation():
         ("Mean reward",      metrics["mean_reward"],
          SMARTDRIVE_GPU["mean_reward"],
          SMARTDRIVE_EDGE["mean_reward"], "N/A", "N/A"),
+        ("Reward/step",      metrics["mean_reward_per_step"],
+         0.7727, "N/A", "N/A", "N/A"),
+        ("Mean steps",       metrics["mean_steps"],
+         1944.0, "N/A", "N/A", "N/A"),
         ("Mean speed (km/h)",metrics["mean_speed_kmh"],
          SMARTDRIVE_GPU["mean_speed_kmh"],
          SMARTDRIVE_EDGE["mean_speed_kmh"], "N/A", "N/A"),
@@ -311,6 +318,12 @@ def run_evaluation():
                / SMARTDRIVE_GPU["mean_distance_m"] * 100
     lines.append(f"Distance vs SmartDrive GPU:{dist_imp:+.1f}% "
                  f"({'better' if dist_imp > 0 else 'worse'})")
+
+    sd_rps = 0.7727  # SmartDrive reward/step
+    rps_imp = (metrics["mean_reward_per_step"] - sd_rps) / sd_rps * 100
+    lines.append(f"Reward/step vs SmartDrive: {rps_imp:+.1f}% "
+                 f"({'better' if rps_imp > 0 else 'worse'}) "
+                 f"[ours={metrics['mean_reward_per_step']:.4f} vs SD={sd_rps}]")
 
     summary = "\n".join(lines)
     print(summary)

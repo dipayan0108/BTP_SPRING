@@ -1,184 +1,131 @@
 # reward.py
-# Hybrid reward for SmartDrive + BLIP-FusePPO in CARLA.
 #
-# DESIGN (matches paper Section III-C exactly):
-#   Rt = W_LANE   * r_lane
-#      + W_LIDAR  * r_lidar
-#      + W_SPEED  * r_speed
-#      + W_CENTER * r_center
+# FORMULA (per step, no clip):
+#   r = speed_factor x centering_factor x angle_factor   [SmartDrive base, 0-1]
+#     + W_LIDAR  x r_lidar                               [safety bonus, <=0.3]
+#     + W_SPEED  x r_speed                               [extra gradient below target]
 #
-# FIX-1 (critical): BLIP removed from reward entirely.
-#   The paper's key contribution is BLIP-in-STATE not BLIP-in-reward.
-#   Prior work (VL-SAFE etc.) used VLMs for reward shaping — the paper
-#   explicitly improves upon this by injecting semantics into observations.
-#   Having BLIP in both state AND reward was double-counting and adding
-#   a noisy cosine-similarity signal that fought convergence.
+# LIDAR ZONES (continuous, no cliffs, no dead zones):
+#   d < 2.0m          : critical penalty  (-5 → -1, linear)
+#   2.0 - 3.0m        : warning penalty   (-1 → 0, linear)
+#   3.0 - 5.0m        : safe zone 1 bonus (+1.0)  car-width clearance
+#   5.0 - 7.0m        : neutral           (0)
+#   7.0 - 10.0m       : safe zone 2 bonus (+0.6)  open road ahead
+#   > 10m             : neutral           (0)
 #
-# FIX-7: LiDAR reward term now wired in (was defined in parameters.py
-#   but never called from the reward function).
-#
-# FIX-speed: speed term uses paper's quadratic penalty -(v-vt)²/vt²
-#   instead of SmartDrive's piecewise linear. Quadratic gives a smooth
-#   gradient that always pushes toward vtarget from both sides.
+# PROPERTIES:
+#   - Stopped car cannot earn positive reward (LiDAR gated on speed_factor)
+#   - LiDAR bonus (max 0.3) always < base (max 1.0) — base dominates
+#   - Terminal -100 / good step ~1.3 = 77x deterrence (vs SmartDrive 13x)
+#   - Base alone beats SmartDrive/step: 1.0 > 0.77
 
 import numpy as np
 from parameters import (
-    TARGET_SPEED,
+    MIN_SPEED, TARGET_SPEED, MAX_SPEED,
+    MAX_DISTANCE_FROM_CENTER,
     REWARD_TERMINAL,
-    W_LANE, W_LIDAR, W_SPEED, W_CENTER,
-    LANE_NORM, CENTER_MAX_DIST, CENTER_K, REWARD_CLIP,
-    LIDAR_DMID, LIDAR_DLOW, LIDAR_DCRIT,
-    LIDAR_B1, LIDAR_B2, LIDAR_B3,
-    LIDAR_BONUS, LIDAR_BONUS_RANGES,
+    W_LIDAR, W_SPEED,
+    LIDAR_DCRIT, LIDAR_DLOW,
+    LIDAR_SAFE1_LO, LIDAR_SAFE1_HI,
+    LIDAR_SAFE2_LO, LIDAR_SAFE2_HI,
+    LIDAR_BONUS, LIDAR_BONUS2,
 )
 
 
-# ── Lane-keeping reward (paper Eq.14) ─────────────────────────────────
+# ── SmartDrive base factors ────────────────────────────────────────────
 
-def _r_lane(distance_px):
+def _speed_factor(v):
+    if v < MIN_SPEED:
+        return v / max(MIN_SPEED, 1e-6)
+    if v > TARGET_SPEED:
+        return max(1.0 - (v - TARGET_SPEED) / max(MAX_SPEED - TARGET_SPEED, 1e-6), 0.0)
+    return 1.0
+
+
+def _centering_factor(d):
+    return max(1.0 - d / max(MAX_DISTANCE_FROM_CENTER, 1e-6), 0.0)
+
+
+def _angle_factor(a):
+    return max(1.0 - abs(a) / np.deg2rad(20), 0.0)
+
+
+# ── LiDAR safety term (continuous, no cliffs) ─────────────────────────
+
+def _r_lidar_raw(d):
     """
-    Linear reward for lateral closeness to lane centre.
-    r_lane = 1 - |delta_x| / d_lane
-    Clipped to [0, 1].
-    """
-    return float(np.clip(1.0 - abs(distance_px) / max(LANE_NORM, 1e-6),
-                         0.0, 1.0))
-
-
-# ── LiDAR obstacle-avoidance reward (paper Eq.15) ─────────────────────
-
-def _r_lidar(min_lidar_m):
-    """
-    Piecewise reward based on minimum LiDAR reading (metres).
+    Continuous piecewise LiDAR reward. No gaps or cliffs.
 
     Zones:
-      dmin in [dlow, dmid]         -> moderate penalty (approaching)
-      dmin < dcrit                 -> heavy penalty (critically close)
-      dmin in bonus_ranges         -> positive bonus (safe spacing)
-      otherwise                   -> 0
+      d <  2.0m  : critical  — linear penalty -5+2.5d  (-5 at 0m, -1 at 2m)
+      2.0-3.0m   : warning   — linear penalty -(3-d)    (-1 at 2m,  0 at 3m)
+      3.0-5.0m   : safe 1    — bonus +1.0
+      5.0-7.0m   : neutral   — 0
+      7.0-10.0m  : safe 2    — bonus +0.6
+      > 10m      : neutral   — 0
     """
-    dmin = min_lidar_m
-
-    # Bonus zones first (safe clearance)
-    for (lo, hi) in LIDAR_BONUS_RANGES:
-        if lo <= dmin <= hi:
-            return float(LIDAR_BONUS)
-
-    # Critical zone (very close to obstacle)
-    if dmin < LIDAR_DCRIT:
-        return float(-LIDAR_B2 + LIDAR_B3 * dmin)
-
-    # Approaching zone
-    if LIDAR_DLOW <= dmin <= LIDAR_DMID:
-        drange = max(LIDAR_DMID - LIDAR_DLOW, 1e-6)
-        return float(-LIDAR_B1 * (LIDAR_DMID - dmin) / drange)
-
-    return 0.0
+    if d < LIDAR_DCRIT:                        # < 2.0m: critical
+        return -5.0 + 2.5 * d
+    if LIDAR_DCRIT <= d < LIDAR_DLOW:          # 2.0-3.0m: warning
+        return -(LIDAR_DLOW - d)
+    if LIDAR_SAFE1_LO <= d <= LIDAR_SAFE1_HI:  # 3.0-5.0m: safe zone 1
+        return float(LIDAR_BONUS)
+    if LIDAR_SAFE2_LO <= d <= LIDAR_SAFE2_HI:  # 7.0-10.0m: safe zone 2
+        return float(LIDAR_BONUS2)
+    return 0.0                                  # neutral
 
 
-# ── Speed reward (paper Eq.16 — quadratic) ────────────────────────────
-
-def _r_speed(velocity_kmh):
-    """
-    Quadratic penalty for deviation from target speed.
-    r_speed = -(v - vtarget)^2 / vtarget^2
-    Range: (-inf, 0] — always non-positive, zero only at vtarget.
-    Gives smooth gradient from both under-speed and over-speed.
-    """
-    vt = max(TARGET_SPEED, 1e-6)
-    return float(-((velocity_kmh - vt) ** 2) / (vt ** 2))
-
-
-# ── Centre penalty (paper Eq.17 — quadratic) ──────────────────────────
-
-def _r_center(distance_px):
-    """
-    Quadratic penalty for large lateral offsets.
-    r_center = -k * (|delta_x| / d_clip)^2
-    """
-    dclip = max(CENTER_MAX_DIST, 1e-6)
-    return float(-CENTER_K * (abs(distance_px) / dclip) ** 2)
-
-
-# ── Main reward function ───────────────────────────────────────────────
+# ── Diagnostic terms for CSV logger ───────────────────────────────────
 
 def reward_terms(
-    distance_px: float = 0.0,
-    min_lidar_m: float = 100.0,
-    velocity_kmh: float = 0.0,
-) -> dict:
-    """
-    Returns the individual unweighted reward components as a dict.
-    Used by environment.py to populate info dict for CSV logging.
-    Call this BEFORE compute_reward() so terms are always available.
-    """
+    distance_from_center_m=0.0,
+    velocity_kmh=0.0,
+    angle_rad=0.0,
+    min_lidar_m=100.0,
+    distance_px=0.0,
+):
+    sf = _speed_factor(velocity_kmh)
+    cf = _centering_factor(distance_from_center_m)
+    af = _angle_factor(angle_rad)
+    r_base  = sf * cf * af
+    lidar_raw = _r_lidar_raw(min_lidar_m)
+    lidar_gated = lidar_raw if sf > 0.1 else 0.0
+    r_lidar = W_LIDAR * float(np.clip(lidar_gated, -5.0, LIDAR_BONUS))
+    r_speed = W_SPEED * max(-((velocity_kmh - TARGET_SPEED)**2)
+                            / (TARGET_SPEED**2), -0.5) if sf < 1.0 else 0.0
     return {
-        "r_lane":   _r_lane(distance_px),
-        "r_lidar":  _r_lidar(min_lidar_m),
-        "r_speed":  _r_speed(velocity_kmh),
-        "r_center": _r_center(distance_px),
+        "r_base":   r_base,
+        "r_lane":   r_base,
+        "r_lidar":  float(r_lidar),
+        "r_speed":  float(r_speed),
+        "r_center": float(cf),
     }
 
 
+# ── Main reward ────────────────────────────────────────────────────────
+
 def compute_reward(
-    distance_from_center_m,   # float  — metres from lane centre
-    velocity_kmh,             # float  — current speed km/h
-    angle_rad,                # float  — heading error vs waypoint (radians)
-    done,                     # bool   — episode terminated flag
-    failed,                   # bool   — True if terminated due to violation
-    distance_px=0.0,          # float  — lateral offset in pixels (Hough)
-    min_lidar_m=100.0,        # float  — minimum LiDAR reading in metres
+    distance_from_center_m,
+    velocity_kmh,
+    angle_rad,
+    done,
+    failed,
+    distance_px=0.0,
+    min_lidar_m=100.0,
 ):
-    """
-    Returns scalar reward.
-
-    Terminal:  REWARD_TERMINAL (-10) on any constraint violation.
-    Normal:    Weighted sum of 4 terms from paper Table I.
-
-    Scale is directly comparable with SmartDrive's reported metrics
-    because the base lane/speed/center logic maps to the same driving
-    quality criteria (SmartDrive uses a multiplicative form; we use
-    the paper's additive weighted form which is equivalent at optimum).
-
-    Parameters
-    ----------
-    distance_from_center_m : float
-        Metres from lane centre (from waypoint geometry, real units).
-    velocity_kmh : float
-        Current vehicle speed in km/h.
-    angle_rad : float
-        Signed heading error in radians.
-    done : bool
-        Episode is ending this step.
-    failed : bool
-        Ended due to constraint violation (collision, lane exit, etc.).
-    distance_px : float
-        Lateral offset in pixels from Hough lane detector (for r_lane,
-        r_center terms which use pixel scale per paper Table I).
-    min_lidar_m : float
-        Minimum LiDAR range reading in metres (for r_lidar term).
-    """
-
-    # ── Terminal penalty ──────────────────────────────────────────────
     if failed:
         return float(REWARD_TERMINAL)
 
-    # ── Four reward terms (paper Eq.13) ──────────────────────────────
-    r_lane   = _r_lane(distance_px)
-    r_lidar  = _r_lidar(min_lidar_m)
-    r_speed  = _r_speed(velocity_kmh)
-    r_center = _r_center(distance_px)
+    sf = _speed_factor(velocity_kmh)
+    cf = _centering_factor(distance_from_center_m)
+    af = _angle_factor(angle_rad)
+    r_base = sf * cf * af
 
-    rt = (W_LANE   * r_lane
-        + W_LIDAR  * r_lidar
-        + W_SPEED  * r_speed
-        + W_CENTER * r_center)
+    lidar_raw   = _r_lidar_raw(min_lidar_m)
+    lidar_gated = lidar_raw if sf > 0.1 else 0.0
+    r_lidar = W_LIDAR * float(np.clip(lidar_gated, -5.0, LIDAR_BONUS))
 
-    # ── Clip per paper Eq.19 ─────────────────────────────────────────
-    # Note: REWARD_CLIP=2.0 (raised from paper's 1.0) so that the LiDAR
-    # bonus (W_LIDAR * LIDAR_BONUS = 0.3 * 5 = 1.5) is not crushed to 1.0
-    # alongside a positive r_lane term. The terminal penalty (-10) is NOT
-    # clipped — it bypasses this line via the early-return above.
-    rt = float(np.clip(rt, -REWARD_CLIP, REWARD_CLIP))
+    r_speed = W_SPEED * max(-((velocity_kmh - TARGET_SPEED)**2)
+                            / (TARGET_SPEED**2), -0.5) if sf < 1.0 else 0.0
 
-    return rt
+    return float(r_base + r_lidar + r_speed)

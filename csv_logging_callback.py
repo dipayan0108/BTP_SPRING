@@ -50,7 +50,9 @@ CSV_COLUMNS = [
     # ── Exploration ───────────────────────────────────────────────────
     "sigma_noise",           # current policy std — confirms decay is working
     # ── Reward term breakdown ─────────────────────────────────────────
-    # Lets you see which term dominates / is miscalibrated per episode.
+    # r_base_mean = SmartDrive base (speed x centering x angle) in [0,1]
+    # Compare directly with SmartDrive's per-step ~0.77 to confirm parity.
+    "r_base_mean",
     "r_lane_mean",
     "r_lidar_mean",
     "r_speed_mean",
@@ -79,6 +81,7 @@ class CSVLoggingCallback(BaseCallback):
         self._reward_history    = []
 
         # Per-episode reward term accumulators
+        self._r_base_sum   = 0.0
         self._r_lane_sum   = 0.0
         self._r_lidar_sum  = 0.0
         self._r_speed_sum  = 0.0
@@ -124,6 +127,7 @@ class CSVLoggingCallback(BaseCallback):
             self._episode_length += 1
 
             # Accumulate individual reward terms if environment exposes them
+            self._r_base_sum   += float(info.get("r_base",   0.0))
             self._r_lane_sum   += float(info.get("r_lane",   0.0))
             self._r_lidar_sum  += float(info.get("r_lidar",  0.0))
             self._r_speed_sum  += float(info.get("r_speed",  0.0))
@@ -142,6 +146,7 @@ class CSVLoggingCallback(BaseCallback):
 
                 # Reward term means (0 if env doesn't expose them)
                 n = max(self._r_steps, 1)
+                r_base_mean   = round(self._r_base_sum   / n, 5)
                 r_lane_mean   = round(self._r_lane_sum   / n, 5)
                 r_lidar_mean  = round(self._r_lidar_sum  / n, 5)
                 r_speed_mean  = round(self._r_speed_sum  / n, 5)
@@ -163,6 +168,7 @@ class CSVLoggingCallback(BaseCallback):
                     "lane_deviation_m": round(float(info.get("center_lane_deviation", 0)), 6),
                     "done_reason":      done_reason,
                     "sigma_noise":      round(self._get_sigma(), 5),
+                    "r_base_mean":      r_base_mean,
                     "r_lane_mean":      r_lane_mean,
                     "r_lidar_mean":     r_lidar_mean,
                     "r_speed_mean":     r_speed_mean,
@@ -186,6 +192,7 @@ class CSVLoggingCallback(BaseCallback):
                 # Reset episode accumulators
                 self._episode_reward = 0.0
                 self._episode_length = 0
+                self._r_base_sum     = 0.0
                 self._r_lane_sum     = 0.0
                 self._r_lidar_sum    = 0.0
                 self._r_speed_sum    = 0.0
